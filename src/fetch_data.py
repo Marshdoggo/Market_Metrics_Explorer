@@ -20,65 +20,164 @@ TICKERS_CSV = os.path.join(CACHE_DIR, 'sp500_tickers.csv')
 PRICES_PARQUET = os.path.join(CACHE_DIR, 'prices.parquet')
 META_PARQUET = os.path.join(CACHE_DIR, 'meta.parquet')
 
-def get_sp500_constituents(force_refresh=False) -> pd.DataFrame:
+# Repo root (this file lives in src/)
+ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
+BUNDLED_TICKERS = ROOT_DIR / "sp500_tickers.csv"
+
+def get_sp500_constituents(force_refresh: bool = False) -> pd.DataFrame:
+    """
+    Return a DataFrame with columns: Ticker, Name, Sector, SubIndustry.
+    Prefers cached CSV; fetches Wikipedia; falls back to bundled CSV if needed.
+    """
+    # 1) Cached
     if os.path.exists(TICKERS_CSV) and not force_refresh:
-        return pd.read_csv(TICKERS_CSV)
+        try:
+            df = pd.read_csv(TICKERS_CSV)
+            if {"Ticker","Name","Sector"}.issubset(df.columns):
+                return df
+        except Exception:
+            pass
 
-    import requests
+    # 2) Wikipedia
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/126.0.0.0 Safari/537.36"
-        )
-    }
-
     try:
-        html = _HTTP.get(url, headers=headers, timeout=20).text
+        html = _HTTP.get(url, timeout=20).text
         tables = pd.read_html(html)
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch S&P 500 list: {e}")
-
-    df = tables[0][['Symbol','Security','GICS Sector','GICS Sub-Industry']].rename(
-        columns={
-            'Symbol': 'Ticker',
-            'Security': 'Name',
-            'GICS Sector': 'Sector',
-            'GICS Sub-Industry': 'SubIndustry'
+        df = tables[0].copy()
+        # Normalize headers across wiki variants
+        df.rename(columns={c: c.strip() for c in df.columns}, inplace=True)
+        rename_map = {
+            "Symbol": "Ticker",
+            "Security": "Name",
+            "GICS Sector": "Sector",
+            "GICS Sub-Industry": "SubIndustry",
+            "GICS sector": "Sector",
+            "GICS sub-industry": "SubIndustry",
         }
-    )
-    df['Ticker'] = df['Ticker'].str.replace('.', '-', regex=False)
-    df.to_csv(TICKERS_CSV, index=False)
-    df.to_parquet(META_PARQUET, index=False)
+        df.rename(columns=rename_map, inplace=True)
+        keep = [c for c in ["Ticker","Name","Sector","SubIndustry"] if c in df.columns]
+        df = df[keep]
+        df["Ticker"] = df["Ticker"].astype(str).str.replace(".", "-", regex=False).str.upper().str.strip()
+    except Exception:
+        # 3) Fallback: bundled CSV committed in the repo
+        if BUNDLED_TICKERS.exists():
+            df = pd.read_csv(BUNDLED_TICKERS)
+            df.rename(columns={c: c.strip() for c in df.columns}, inplace=True)
+            if "Symbol" in df.columns and "Ticker" not in df.columns:
+                df.rename(columns={"Symbol": "Ticker"}, inplace=True)
+            if "Security" in df.columns and "Name" not in df.columns:
+                df.rename(columns={"Security": "Name"}, inplace=True)
+            if "GICS Sector" in df.columns and "Sector" not in df.columns:
+                df.rename(columns={"GICS Sector": "Sector"}, inplace=True)
+            if "GICS Sub-Industry" in df.columns and "SubIndustry" not in df.columns:
+                df.rename(columns={"GICS Sub-Industry": "SubIndustry"}, inplace=True)
+            keep = [c for c in ["Ticker","Name","Sector","SubIndustry"] if c in df.columns]
+            df = df[keep]
+            df["Ticker"] = df["Ticker"].astype(str).str.replace(".", "-", regex=False).str.upper().str.strip()
+        else:
+            # Last resort: empty schema
+            return pd.DataFrame(columns=["Ticker","Name","Sector","SubIndustry"])
+
+    # Persist cache/meta and return
+    try:
+        df.to_csv(TICKERS_CSV, index=False)
+    except Exception:
+        pass
+    try:
+        df.to_parquet(META_PARQUET, index=False)
+    except Exception:
+        pass
     return df
 
-def download_prices(tickers, start=None, end=None, force_refresh=False) -> pd.DataFrame:
+def _download_chunk(tickers: list[str], start=None, end=None) -> pd.DataFrame:
+    """
+    Download a chunk of tickers via yfinance and return a wide frame of Adj Close (or Close) columns.
+    """
+    if not tickers:
+        return pd.DataFrame()
+
+    df = yf.download(
+        " ".join(tickers),
+        start=start, end=end,
+        interval="1d",
+        auto_adjust=True,
+        group_by="ticker",
+        threads=True,
+        progress=False,
+    )
+
+    if isinstance(df.columns, pd.MultiIndex):
+        closes = {}
+        for t in tickers:
+            try:
+                sub = df[t]
+            except Exception:
+                continue
+            s = sub.get("Adj Close", sub.get("Close"))
+            if s is not None is not False:
+                closes[t] = s
+        out = pd.DataFrame(closes)
+    else:
+        # single symbol path
+        col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
+        if col is None:
+            return pd.DataFrame()
+        out = df[[col]].copy()
+        out.columns = [tickers[0]]
+
+    return out.sort_index()
+
+def download_prices(tickers, start=None, end=None, force_refresh: bool = False) -> pd.DataFrame:
+    """
+    Robust multi-ticker downloader with chunking + retries.
+    Returns a wide DataFrame of prices (Adj Close if available), indexed by date.
+    """
+    tickers = [t.replace(".", "-").upper().strip() for t in list(tickers or [])]
+    if not tickers:
+        return pd.DataFrame()
+
+    # Serve cached parquet if suitable
     if os.path.exists(PRICES_PARQUET) and not force_refresh:
         try:
             prices = pd.read_parquet(PRICES_PARQUET)
             if start:
-                prices = prices[prices.index>=pd.to_datetime(start)]
+                prices = prices[prices.index >= pd.to_datetime(start)]
             if end:
-                prices = prices[prices.index<=pd.to_datetime(end)]
-            return prices
+                prices = prices[prices.index <= pd.to_datetime(end)]
+            if not prices.empty:
+                return prices
         except Exception:
             pass
+
     if start is None:
         start = trading_days_ago(400).date()
-    data = yf.download(list(tickers), start=start, end=end, progress=False, group_by='ticker', auto_adjust=True)
-    # Normalize to MultiIndex -> wide frame of AdjClose only
-    if isinstance(data.columns, pd.MultiIndex):
-        closes = {}
-        for t in tickers:
+
+    CHUNK = 40
+    parts = []
+    tickers = list(dict.fromkeys(tickers))  # de-dup preserving order
+    for i in range(0, len(tickers), CHUNK):
+        chunk = tickers[i:i+CHUNK]
+        last_exc = None
+        for attempt in range(3):
             try:
-                closes[t] = data[t]['Close']
-            except Exception:
-                continue
-        prices = pd.DataFrame(closes).dropna(how='all')
-    else:
-        prices = data['Close'].to_frame()
-    prices.to_parquet(PRICES_PARQUET)
+                part = _download_chunk(chunk, start=start, end=end)
+                if not part.empty:
+                    parts.append(part)
+                break
+            except Exception as e:
+                last_exc = e
+                time.sleep(1.0 * (attempt + 1))
+        # small courtesy delay for rate-limits
+        time.sleep(0.25)
+    if not parts:
+        return pd.DataFrame()
+
+    prices = pd.concat(parts, axis=1)
+    prices = prices.ffill().bfill().dropna(how="all", axis=1)
+    try:
+        prices.to_parquet(PRICES_PARQUET)
+    except Exception:
+        pass
     return prices
 
 def get_meta() -> pd.DataFrame:
