@@ -114,7 +114,7 @@ def _download_chunk(tickers: list[str], start=None, end=None) -> pd.DataFrame:
             except Exception:
                 continue
             s = sub.get("Adj Close", sub.get("Close"))
-            if s is not None is not False:
+            if s is not None:
                 closes[t] = s
         out = pd.DataFrame(closes)
     else:
@@ -140,6 +140,8 @@ def download_prices(tickers, start=None, end=None, force_refresh: bool = False) 
     if os.path.exists(PRICES_PARQUET) and not force_refresh:
         try:
             prices = pd.read_parquet(PRICES_PARQUET)
+            prices.index = pd.to_datetime(prices.index).tz_localize(None)
+            prices = prices.sort_index()
             if start:
                 prices = prices[prices.index >= pd.to_datetime(start)]
             if end:
@@ -173,12 +175,32 @@ def download_prices(tickers, start=None, end=None, force_refresh: bool = False) 
         return pd.DataFrame()
 
     prices = pd.concat(parts, axis=1)
+    prices.index = pd.to_datetime(prices.index).tz_localize(None)
+    prices = prices.sort_index()
+    prices.columns = [str(c).upper().strip() for c in prices.columns]
     prices = prices.ffill().bfill().dropna(how="all", axis=1)
     try:
         prices.to_parquet(PRICES_PARQUET)
     except Exception:
         pass
     return prices
+
+def download_prices_window(
+    tickers,
+    lookback_trading_days: int,
+    asof: Optional[datetime] = None,
+    force_refresh: bool = False
+) -> pd.DataFrame:
+    """
+    Equity helper: convert trading-day lookback to a calendar window (~1.4x buffer)
+    and fetch prices via `download_prices`.
+    """
+    if asof is None:
+        asof = pd.Timestamp.today(tz="UTC").normalize()
+    cal_days = int(lookback_trading_days * 1.4)
+    start = (asof - pd.Timedelta(days=cal_days)).date()
+    end = asof.date()
+    return download_prices(tickers, start=start, end=end, force_refresh=force_refresh)
 
 def get_meta() -> pd.DataFrame:
     if os.path.exists(META_PARQUET):
@@ -287,7 +309,7 @@ def download_prices_fx_fast(
             threads=True,
             **yf_kwargs
         )
-
+        close = pd.DataFrame()
         if isinstance(data.columns, pd.MultiIndex):
             try:
                 close = data.xs("Close", axis=1, level=1, drop_level=True)
@@ -340,7 +362,7 @@ def download_prices_fx_fast(
         except Exception:
             pass
 
-    out = base[pairs].sort_index() if not base.empty else pd.DataFrame(columns=pairs)
+    out = base.reindex(columns=pairs).sort_index() if not base.empty else pd.DataFrame(columns=pairs)
     out.index = pd.to_datetime(out.index).tz_localize(None)
     return out
 
