@@ -21,6 +21,22 @@ from plot_metrics import scatter_xy
 from universes import get_universe
 from utils import parse_tickers
 
+# --- Helper: safe date bounds for Streamlit date_input -------------------------
+def _safe_date_bounds(prices):
+    """
+    Returns (min_day, max_day) as Python date objects that are safe for Streamlit date_input,
+    even if the prices DataFrame is empty or has invalid datetime indices.
+    """
+    try:
+        if hasattr(prices, "index") and len(prices.index) > 0:
+            idx = pd.to_datetime(prices.index, errors="coerce").dropna()
+            if len(idx) > 0:
+                return idx.min().date(), idx.max().date()
+    except Exception:
+        pass
+    today = pd.Timestamp.today(tz="UTC").normalize()
+    return (today - pd.Timedelta(days=365)).date(), today.date()
+
 st.set_page_config(page_title='S&P 500 Metric Explorer', layout='wide')
 
 st.title('📈 S&P 500 Metric Explorer')
@@ -61,19 +77,30 @@ if universe == 'fx':
             force_refresh=refresh_prices,
         )
 else:
-    tickers = tickers_df['Ticker'].tolist()
-    prices = download_prices(tickers, force_refresh=refresh_prices)
+    # Equities (S&amp;P 500, Nasdaq 100, Dow 30): fetch cached prices for the lookback window
+    symbols = tickers_df['Ticker'].tolist()
+    asof_seed = pd.Timestamp.today(tz='UTC')
+    with st.spinner('Loading equity prices…'):
+        prices = download_prices(
+            symbols,
+            lookback_trading_days=int(lookback),
+            asof=asof_seed,
+            force_refresh=refresh_prices,
+        )
 
-# Determine allowable as-of range from the cached prices
-min_day = prices.index.min().date()
-max_day = prices.index.max().date()
+# Guard: if nothing came back, stop early with a helpful message
+if prices is None or getattr(prices, "empty", True):
+    st.error("No price data was fetched. Try toggling 'Refresh universe list' or 'Refresh price cache', or reduce the lookback window.")
+    st.stop()
+
+min_day, max_day = _safe_date_bounds(prices)
+
 with st.sidebar:
     asof = st.date_input('As-of date', value=max_day, min_value=min_day, max_value=max_day)
     compare = st.checkbox('Compare to…', value=False)
+    asof2 = None
     if compare:
         asof2 = st.date_input('As-of date (B)', value=max_day, min_value=min_day, max_value=max_day)
-    else:
-        asof2 = None
 
 # Optional time sliders (control As-of dates)
 with st.sidebar:
