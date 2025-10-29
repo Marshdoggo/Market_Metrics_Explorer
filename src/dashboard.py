@@ -77,21 +77,22 @@ if universe == 'fx':
             force_refresh=refresh_prices,
         )
 else:
-    # Equities (S&amp;P 500, Nasdaq 100, Dow 30): fetch cached prices for the lookback window
+    # Equities (non-FX) block: fetch prices for the given lookback and as-of.
+    from pandas.tseries.offsets import BDay
+
     symbols = tickers_df['Ticker'].tolist()
     asof_seed = pd.Timestamp.today(tz='UTC')
+
     with st.spinner('Loading equity prices…'):
+        end = pd.Timestamp(asof_seed).normalize()
+        start = (end - BDay(int(lookback))).normalize()
+
         prices = download_prices(
             symbols,
-            lookback_trading_days=int(lookback),
-            asof=asof_seed,
+            start=start,
+            end=end,
             force_refresh=refresh_prices,
         )
-
-# Guard: if nothing came back, stop early with a helpful message
-if prices is None or getattr(prices, "empty", True):
-    st.error("No price data was fetched. Try toggling 'Refresh universe list' or 'Refresh price cache', or reduce the lookback window.")
-    st.stop()
 
 min_day, max_day = _safe_date_bounds(prices)
 
