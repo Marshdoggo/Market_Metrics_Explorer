@@ -91,41 +91,77 @@ def get_sp500_constituents(force_refresh: bool = False) -> pd.DataFrame:
 
 def _download_chunk(tickers: list[str], start=None, end=None) -> pd.DataFrame:
     """
-    Download a chunk of tickers via yfinance and return a wide frame of Adj Close (or Close) columns.
+    Try a multi-ticker yfinance download first; if it fails or returns empty,
+    fall back to single-ticker downloads with retries. Returns wide Close/Adj Close.
     """
     if not tickers:
         return pd.DataFrame()
 
-    df = yf.download(
-        " ".join(tickers),
-        start=start, end=end,
-        interval="1d",
-        auto_adjust=True,
-        group_by="ticker",
-        threads=True,
-        progress=False,
-    )
-
-    if isinstance(df.columns, pd.MultiIndex):
+    # 1) Attempt multi-download (fast path)
+    try:
+        df = yf.download(
+            tickers,                 # pass list, not a space-joined string
+            start=start, end=end,
+            interval="1d",
+            auto_adjust=True,
+            group_by="ticker",
+            threads=True,
+            progress=False,
+        )
         closes = {}
-        for t in tickers:
-            try:
-                sub = df[t]
-            except Exception:
-                continue
-            s = sub.get("Adj Close", sub.get("Close"))
-            if s is not None:
-                closes[t] = s
-        out = pd.DataFrame(closes)
-    else:
-        # single symbol path
-        col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
-        if col is None:
-            return pd.DataFrame()
-        out = df[[col]].copy()
-        out.columns = [tickers[0]]
+        if isinstance(df.columns, pd.MultiIndex):
+            # multi-symbol frame
+            for t in tickers:
+                try:
+                    sub = df[t]
+                except Exception:
+                    continue
+                s = sub.get("Adj Close", sub.get("Close"))
+                if s is not None:
+                    closes[t] = s
+        else:
+            # single-symbol frame (batch endpoint occasionally returns this)
+            col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
+            if col:
+                closes[tickers[0]] = df[col]
 
-    return out.sort_index()
+        if closes:
+            out = pd.DataFrame(closes).sort_index()
+            if not out.empty:
+                return out
+    except Exception:
+        # fall back to per-ticker below
+        pass
+
+    # 2) Per-ticker fallback with retries (slower, but resilient)
+    cols: dict[str, pd.Series] = {}
+    for t in tickers:
+        last_exc = None
+        for attempt in range(3):
+            try:
+                one = yf.download(
+                    t, start=start, end=end,
+                    interval="1d", auto_adjust=True,
+                    progress=False, threads=False,
+                )
+                if one.empty:
+                    raise RuntimeError("empty df")
+                col = "Adj Close" if "Adj Close" in one.columns else ("Close" if "Close" in one.columns else None)
+                if col:
+                    s = one[col].rename(t)
+                    cols[t] = s
+                    break
+                else:
+                    raise RuntimeError("no Close/Adj Close")
+            except Exception as e:
+                last_exc = e
+                time.sleep(1.0 * (attempt + 1))
+        # polite pause to avoid rate limits
+        time.sleep(0.25)
+
+    if not cols:
+        return pd.DataFrame()
+    return pd.DataFrame(cols).sort_index()
 
 def download_prices(tickers, start=None, end=None, force_refresh: bool = False) -> pd.DataFrame:
     """
@@ -154,7 +190,7 @@ def download_prices(tickers, start=None, end=None, force_refresh: bool = False) 
     if start is None:
         start = trading_days_ago(400).date()
 
-    CHUNK = 40
+    CHUNK = 10
     parts = []
     tickers = list(dict.fromkeys(tickers))  # de-dup preserving order
     for i in range(0, len(tickers), CHUNK):
