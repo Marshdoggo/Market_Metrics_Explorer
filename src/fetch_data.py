@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import requests
 import yfinance as yf
+import plotly
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -59,20 +60,102 @@ def _safe_concat_price_frames(frames: List[pd.DataFrame]) -> pd.DataFrame:
 _WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 _SP500_CACHE = os.path.join(DATA_DIR, "sp500_constituents.parquet")
 
+# Prefer cache -> local CSV -> live Wikipedia (only when forced or nothing else works)
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+SP500_CSV_FALLBACK = os.path.join(PROJECT_ROOT, "sp500_tickers.csv")
+
+def _from_local_csv() -> pd.DataFrame:
+    """
+    Read sp500_tickers.csv from repo root (optional fallback).
+    Accepts either a single 'Ticker' column or 'Ticker,Name,Sector,SubIndustry'.
+    Returns normalized columns: Ticker, Name, Sector, SubIndustry
+    """
+    if not os.path.exists(SP500_CSV_FALLBACK):
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(SP500_CSV_FALLBACK)
+    except Exception:
+        return pd.DataFrame()
+
+    # Normalize column names and values
+    cols = {c.lower(): c for c in df.columns}
+    if "ticker" not in cols:
+        return pd.DataFrame()
+
+    def _get(col, default=""):
+        return df[cols[col]] if col in cols else default
+
+    out = pd.DataFrame()
+    out["Ticker"] = (
+        df[cols["ticker"]]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .str.replace(".", "-", regex=False)
+    )
+    out["Name"] = _get("name")
+    out["Sector"] = _get("sector")
+    out["SubIndustry"] = _get("subindustry")
+    return out[["Ticker", "Name", "Sector", "SubIndustry"]]
+
 def get_sp500_constituents(force_refresh: bool=False) -> pd.DataFrame:
+    """
+    Columns: Ticker, Name, Sector, SubIndustry
+    Order of preference:
+      1) cached parquet (fast, offline),
+      2) local CSV fallback in repo,
+      3) live Wikipedia (only when forced or nothing else available).
+    """
+    # 1) Cache first (unless force_refresh)
     if os.path.exists(_SP500_CACHE) and not force_refresh:
         try:
-            return pd.read_parquet(_SP500_CACHE)
+            df = pd.read_parquet(_SP500_CACHE)
+            if not df.empty:
+                return df
         except Exception:
             pass
-    _log("[fetch_data] Refreshing S&P500 list from Wikipedia…")
-    tables = pd.read_html(_WIKI_URL)
-    df = tables[0].rename(columns={"Symbol": "Ticker", "Security": "Name"})
-    df["Ticker"] = df["Ticker"].astype(str).str.strip()
-    df.to_parquet(_SP500_CACHE, index=False)
-    return df[["Ticker","Name","GICS Sector","GICS Sub-Industry"]].rename(
-        columns={"GICS Sector":"Sector","GICS Sub-Industry":"SubIndustry"}
-    )
+
+    # 2) Local CSV fallback (unless force_refresh)
+    if not force_refresh:
+        local_df = _from_local_csv()
+        if not local_df.empty:
+            try:
+                local_df.to_parquet(_SP500_CACHE, index=False)
+            except Exception:
+                pass
+            return local_df
+
+    # 3) Live Wikipedia (explicit refresh or last resort)
+    try:
+        _log("[fetch_data] Fetching S&P500 list from Wikipedia…")
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            )
+        }
+        html = requests.get(_WIKI_URL, headers=headers, timeout=20).text
+        tables = pd.read_html(io.StringIO(html))
+        df = tables[0].rename(columns={"Symbol": "Ticker", "Security": "Name"})
+        df["Ticker"] = (
+            df["Ticker"].astype(str).str.strip().str.upper().str.replace(".", "-", regex=False)
+        )
+        df = df[
+            ["Ticker", "Name", "GICS Sector", "GICS Sub-Industry"]
+        ].rename(columns={"GICS Sector": "Sector", "GICS Sub-Industry": "SubIndustry"})
+
+        try:
+            df.to_parquet(_SP500_CACHE, index=False)
+        except Exception:
+            pass
+        return df
+    except Exception as e:
+        _log(f"[fetch_data] Wikipedia fetch failed: {e!r}")
+        # Last resort: local CSV even if force_refresh was requested
+        local_df = _from_local_csv()
+        if not local_df.empty:
+            return local_df
+        return pd.DataFrame(columns=["Ticker", "Name", "Sector", "SubIndustry"])
 
 # ---------------------- Robust equity downloader ----------------------
 
