@@ -62,29 +62,37 @@ _SP500_CACHE = os.path.join(DATA_DIR, "sp500_constituents.parquet")
 
 # Prefer cache -> local CSV -> live Wikipedia (only when forced or nothing else works)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
-SP500_CSV_FALLBACK = os.path.join(PROJECT_ROOT, "sp500_tickers.csv")
+# Candidates: repo root and data/ folder
+_CSV_CANDIDATES = [
+    os.path.join(PROJECT_ROOT, "sp500_tickers.csv"),
+    os.path.join(DATA_DIR, "sp500_tickers.csv"),
+]
 
 def _from_local_csv() -> pd.DataFrame:
     """
-    Read sp500_tickers.csv from repo root (optional fallback).
+    Read sp500_tickers.csv from common locations.
     Accepts either a single 'Ticker' column or 'Ticker,Name,Sector,SubIndustry'.
     Returns normalized columns: Ticker, Name, Sector, SubIndustry
     """
-    if not os.path.exists(SP500_CSV_FALLBACK):
+    df = None
+    for path in _CSV_CANDIDATES:
+        if os.path.exists(path):
+            try:
+                df = pd.read_csv(path)
+                break
+            except Exception:
+                continue
+    if df is None or df.empty:
         return pd.DataFrame()
-    try:
-        df = pd.read_csv(SP500_CSV_FALLBACK)
-    except Exception:
-        return pd.DataFrame()
-
+    
     # Normalize column names and values
     cols = {c.lower(): c for c in df.columns}
     if "ticker" not in cols:
         return pd.DataFrame()
-
+    
     def _get(col, default=""):
         return df[cols[col]] if col in cols else default
-
+    
     out = pd.DataFrame()
     out["Ticker"] = (
         df[cols["ticker"]]
@@ -234,11 +242,21 @@ def download_prices(
     if os.path.exists(PRICES_PARQUET) and not force_refresh:
         try:
             cached = pd.read_parquet(PRICES_PARQUET)
-            # if we requested a window, trim here
-            if start is not None:
-                cached = cached[cached.index >= pd.to_datetime(start)]
-            if end is not None:
-                cached = cached[cached.index <= pd.to_datetime(end)]
+            if not cached.empty:
+                # Coerce to a clean tz-naive DatetimeIndex before trimming
+                idx = pd.to_datetime(cached.index, errors="coerce")
+                mask = ~pd.isna(idx)
+                if mask.any():
+                    cached = cached.loc[mask]
+                    cached.index = pd.DatetimeIndex(idx[mask]).tz_localize(None)
+                else:
+                    cached = pd.DataFrame()
+            # if we requested a window, trim here (only when index is valid)
+            if not cached.empty:
+                if start is not None:
+                    cached = cached[cached.index >= pd.to_datetime(start)]
+                if end is not None:
+                    cached = cached[cached.index <= pd.to_datetime(end)]
             if not cached.empty:
                 _log(f"[fetch_data] Served {cached.shape[1]} tickers from cache.")
                 return cached
@@ -291,11 +309,20 @@ def download_prices(
         except Exception as e:
             _log(f"[fetch_data] cache write failed: {e!r}")
 
-    # Final trims on requested window
-    if start is not None:
-        out = out[out.index >= pd.to_datetime(start)]
-    if end is not None:
-        out = out[out.index <= pd.to_datetime(end)]
+    # Final trims on requested window (only after ensuring a proper DatetimeIndex)
+    if not out.empty:
+        idx = pd.to_datetime(out.index, errors="coerce")
+        mask = ~pd.isna(idx)
+        if mask.any():
+            out = out.loc[mask]
+            out.index = pd.DatetimeIndex(idx[mask]).tz_localize(None)
+            if start is not None:
+                out = out[out.index >= pd.to_datetime(start)]
+            if end is not None:
+                out = out[out.index <= pd.to_datetime(end)]
+        else:
+            # Index was unusable; return the raw (unfiltered) result
+            pass
 
     # Log failures succinctly (Streamlit console shows them)
     failed_unique = sorted(set(all_failed))
