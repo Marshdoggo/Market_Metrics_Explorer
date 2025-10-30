@@ -39,7 +39,7 @@ def _safe_date_bounds(prices):
 
 st.set_page_config(page_title='S&P 500 Metric Explorer', layout='wide')
 
-st.title('📈 S&P 500 Metric Explorer')
+st.title('📈 Market Metric Explorer')
 
 with st.sidebar:
     st.header('Settings')
@@ -76,6 +76,20 @@ if universe == 'fx':
             asof=asof_seed,
             force_refresh=refresh_prices,
         )
+    # Robust fallback if cache was empty or failed
+    if prices is None or getattr(prices, "empty", True):
+        if not refresh_prices:
+            with st.spinner("No FX prices found in cache. Forcing a fresh fetch…"):
+                prices = download_prices_fx_window(
+                    pairs,
+                    lookback_trading_days=int(lookback),
+                    asof=asof_seed,
+                    force_refresh=True,
+                )
+        # If still empty, stop early with a helpful message
+        if prices is None or getattr(prices, "empty", True):
+            st.error("No FX price data available after refresh. Please try again in a minute (rate limit) or toggle 'Refresh price cache'.")
+            st.stop()
 else:
     # Equities (non-FX) block: fetch prices for the given lookback and as-of.
     from pandas.tseries.offsets import BDay
@@ -93,6 +107,20 @@ else:
             end=end,
             force_refresh=refresh_prices,
         )
+    # Robust fallback if cache was empty or failed
+    if prices is None or getattr(prices, "empty", True):
+        if not refresh_prices:
+            with st.spinner("No equity prices found in cache. Forcing a fresh fetch…"):
+                prices = download_prices(
+                    symbols,
+                    start=start,
+                    end=end,
+                    force_refresh=True,
+                )
+        # If still empty, stop early with a helpful message
+        if prices is None or getattr(prices, "empty", True):
+            st.error("No equity price data available after refresh. Please try again in a minute (rate limit) or toggle 'Refresh price cache'.")
+            st.stop()
 
 min_day, max_day = _safe_date_bounds(prices)
 

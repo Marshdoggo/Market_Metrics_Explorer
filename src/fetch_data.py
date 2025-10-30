@@ -1,5 +1,5 @@
 import os, io, pandas as pd, numpy as np, yfinance as yf
-import time, pathlib, json, requests
+import time, pathlib, json, requests, random
 from datetime import datetime
 from typing import Optional
 try:
@@ -89,79 +89,86 @@ def get_sp500_constituents(force_refresh: bool = False) -> pd.DataFrame:
         pass
     return df
 
+
+def _download_one_yf(ticker: str, start=None, end=None) -> pd.Series:
+    """Single-symbol fallback using Ticker.history(). Returns a Close/Adj Close Series or empty."""
+    try:
+        hist = yf.Ticker(ticker).history(
+            start=start, end=end, interval="1d", auto_adjust=True, actions=False
+        )
+        if hist is None or hist.empty:
+            return pd.Series(dtype=float, name=ticker)
+        s = hist.get("Close")
+        if s is None:
+            s = hist.get("Adj Close")
+        if s is None or s.empty:
+            return pd.Series(dtype=float, name=ticker)
+        s.name = ticker
+        return s
+    except Exception:
+        return pd.Series(dtype=float, name=ticker)
+
 def _download_chunk(tickers: list[str], start=None, end=None) -> pd.DataFrame:
     """
-    Try a multi-ticker yfinance download first; if it fails or returns empty,
-    fall back to single-ticker downloads with retries. Returns wide Close/Adj Close.
+    Multi -> per-ticker fallback with retries.
+    Returns a wide DataFrame (Adj Close/Close) indexed by date.
     """
+    tickers = [t for t in tickers if t]
     if not tickers:
         return pd.DataFrame()
 
-    # 1) Attempt multi-download (fast path)
+    # --- 1) Try multi-download first (threads=False is more stable on Streamlit Cloud)
+    ok: dict[str, pd.Series] = {}
     try:
-        df = yf.download(
-            tickers,                 # pass list, not a space-joined string
+        data = yf.download(
+            tickers,
             start=start, end=end,
-            interval="1d",
-            auto_adjust=True,
-            group_by="ticker",
-            threads=True,
+            interval="1d", auto_adjust=True,
+            group_by="ticker", threads=False,
             progress=False,
         )
-        closes = {}
-        if isinstance(df.columns, pd.MultiIndex):
-            # multi-symbol frame
+        if isinstance(data.columns, pd.MultiIndex):
             for t in tickers:
                 try:
-                    sub = df[t]
+                    sub = data[t]
                 except Exception:
                     continue
                 s = sub.get("Adj Close", sub.get("Close"))
-                if s is not None:
-                    closes[t] = s
+                if s is not None and not s.empty:
+                    s = s.dropna()
+                    if not s.empty:
+                        s.name = t
+                        ok[t] = s
         else:
-            # single-symbol frame (batch endpoint occasionally returns this)
-            col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
+            # single-symbol return shape
+            col = "Adj Close" if "Adj Close" in data.columns else ("Close" if "Close" in data.columns else None)
             if col:
-                closes[tickers[0]] = df[col]
-
-        if closes:
-            out = pd.DataFrame(closes).sort_index()
-            if not out.empty:
-                return out
+                s = data[col].dropna()
+                if not s.empty:
+                    s.name = tickers[0]
+                    ok[tickers[0]] = s
     except Exception:
-        # fall back to per-ticker below
+        # fall through to per-ticker path
         pass
 
-    # 2) Per-ticker fallback with retries (slower, but resilient)
-    cols: dict[str, pd.Series] = {}
-    for t in tickers:
-        last_exc = None
-        for attempt in range(3):
-            try:
-                one = yf.download(
-                    t, start=start, end=end,
-                    interval="1d", auto_adjust=True,
-                    progress=False, threads=False,
-                )
-                if one.empty:
-                    raise RuntimeError("empty df")
-                col = "Adj Close" if "Adj Close" in one.columns else ("Close" if "Close" in one.columns else None)
-                if col:
-                    s = one[col].rename(t)
-                    cols[t] = s
-                    break
-                else:
-                    raise RuntimeError("no Close/Adj Close")
-            except Exception as e:
-                last_exc = e
-                time.sleep(1.0 * (attempt + 1))
-        # polite pause to avoid rate limits
-        time.sleep(0.25)
+    # --- 2) Per-ticker fallback for any misses with retries + backoff + jitter
+    missing = [t for t in tickers if t not in ok]
+    for t in missing:
+        for k in range(3):
+            s = _download_one_yf(t, start=start, end=end)
+            if not s.empty:
+                ok[t] = s
+                break
+            time.sleep((0.6 * (2 ** k)) + random.random() * 0.4)
 
-    if not cols:
+    if not ok:
         return pd.DataFrame()
-    return pd.DataFrame(cols).sort_index()
+
+    out = pd.concat(ok.values(), axis=1).sort_index()
+    out.columns = [str(c).upper().strip() for c in out.columns]
+    out.index = pd.to_datetime(out.index).tz_localize(None)
+    out = out.dropna(how="all", axis=1)
+    return out
 
 def download_prices(tickers, start=None, end=None, force_refresh: bool = False) -> pd.DataFrame:
     """
@@ -206,7 +213,7 @@ def download_prices(tickers, start=None, end=None, force_refresh: bool = False) 
                 last_exc = e
                 time.sleep(1.0 * (attempt + 1))
         # small courtesy delay for rate-limits
-        time.sleep(0.25)
+        time.sleep(0.5 + random.random() * 0.3)
     if not parts:
         return pd.DataFrame()
 
