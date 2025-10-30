@@ -59,6 +59,18 @@ def _safe_concat_price_frames(frames: List[pd.DataFrame]) -> pd.DataFrame:
     df = df.dropna(axis=1, how="all")
     return df
 
+
+def _to_naive_ts(x):
+    if x is None:
+        return None
+    ts = pd.to_datetime(x, errors="coerce")
+    if isinstance(ts, pd.Timestamp) and ts.tz is not None:
+        try:
+            ts = ts.tz_convert(None)
+        except Exception:
+            ts = ts.tz_localize(None)
+    return ts
+
 # ---------------------- S&P500 Constituents ----------------------
 # If you already have this in another file, keep using that. Minimal impl here:
 
@@ -270,6 +282,9 @@ def download_prices(
     if not symbols:
         return pd.DataFrame()
 
+    start = _to_naive_ts(start)
+    end   = _to_naive_ts(end)
+
     # Serve cache if available and not forcing refresh
     if os.path.exists(PRICES_PARQUET) and not force_refresh:
         try:
@@ -290,9 +305,9 @@ def download_prices(
             # if we requested a window, trim here (only when index is valid)
             if not cached.empty:
                 if start is not None:
-                    cached = cached[cached.index >= pd.to_datetime(start)]
+                    cached = cached[cached.index >= start]
                 if end is not None:
-                    cached = cached[cached.index <= pd.to_datetime(end)]
+                    cached = cached[cached.index <= end]
             if not cached.empty:
                 _log(f"[fetch_data] Served {cached.shape[1]} tickers from cache.")
                 return cached
@@ -372,9 +387,9 @@ def download_prices(
             out = out.loc[mask]
             out.index = pd.DatetimeIndex(idx[mask]).tz_localize(None)
             if start is not None:
-                out = out[out.index >= pd.to_datetime(start)]
+                out = out[out.index >= start]
             if end is not None:
-                out = out[out.index <= pd.to_datetime(end)]
+                out = out[out.index <= end]
         else:
             # Index was unusable; return the raw (unfiltered) result
             pass
