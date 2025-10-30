@@ -1,462 +1,266 @@
-import os, io, pandas as pd, numpy as np, yfinance as yf
-import time, pathlib, json, requests, random
-from datetime import datetime
-from typing import Optional
-try:
-    from dotenv import load_dotenv
-    load_dotenv()  # also picks up project root .env by default
-except ImportError:
-    pass
+# src/fetch_data.py
+from __future__ import annotations
+import os, io, time, json, math, textwrap
+from typing import List, Iterable, Tuple, Optional, Dict
 
-_HTTP = requests.Session()
-_HTTP.headers.update({
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
-})
+import pandas as pd
+import numpy as np
+import requests
+import yfinance as yf
 
-from utils import ensure_cache_dir, trading_days_ago
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
 
-CACHE_DIR = ensure_cache_dir()
-TICKERS_CSV = os.path.join(CACHE_DIR, 'sp500_tickers.csv')
-PRICES_PARQUET = os.path.join(CACHE_DIR, 'prices.parquet')
-META_PARQUET = os.path.join(CACHE_DIR, 'meta.parquet')
+PRICES_PARQUET = os.path.join(DATA_DIR, "prices.parquet")
+FX_YF_PARQUET  = os.path.join(DATA_DIR, "fx_yf.parquet")
 
-# Repo root (this file lives in src/)
-ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
-BUNDLED_TICKERS = ROOT_DIR / "sp500_tickers.csv"
+# ---------------------- Utilities ----------------------
 
-def get_sp500_constituents(force_refresh: bool = False) -> pd.DataFrame:
-    """
-    Return a DataFrame with columns: Ticker, Name, Sector, SubIndustry.
-    Prefers cached CSV; fetches Wikipedia; falls back to bundled CSV if needed.
-    """
-    # 1) Cached
-    if os.path.exists(TICKERS_CSV) and not force_refresh:
-        try:
-            df = pd.read_csv(TICKERS_CSV)
-            if {"Ticker","Name","Sector"}.issubset(df.columns):
-                return df
-        except Exception:
-            pass
+def _sanitize_symbols(symbols: Iterable[str]) -> List[str]:
+    out = []
+    for s in symbols or []:
+        if not s: 
+            continue
+        s = str(s).strip().upper().replace(".", "-")
+        # filter very weird things that yfinance chokes on
+        if any(ch in s for ch in (" ", "/", "\\")):
+            continue
+        out.append(s)
+    # dedupe, preserve order
+    seen = set(); clean = []
+    for s in out:
+        if s not in seen:
+            seen.add(s); clean.append(s)
+    return clean
 
-    # 2) Wikipedia
-    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    try:
-        html = _HTTP.get(url, timeout=20).text
-        tables = pd.read_html(html)
-        df = tables[0].copy()
-        # Normalize headers across wiki variants
-        df.rename(columns={c: c.strip() for c in df.columns}, inplace=True)
-        rename_map = {
-            "Symbol": "Ticker",
-            "Security": "Name",
-            "GICS Sector": "Sector",
-            "GICS Sub-Industry": "SubIndustry",
-            "GICS sector": "Sector",
-            "GICS sub-industry": "SubIndustry",
-        }
-        df.rename(columns=rename_map, inplace=True)
-        keep = [c for c in ["Ticker","Name","Sector","SubIndustry"] if c in df.columns]
-        df = df[keep]
-        df["Ticker"] = df["Ticker"].astype(str).str.replace(".", "-", regex=False).str.upper().str.strip()
-    except Exception:
-        # 3) Fallback: bundled CSV committed in the repo
-        if BUNDLED_TICKERS.exists():
-            df = pd.read_csv(BUNDLED_TICKERS)
-            df.rename(columns={c: c.strip() for c in df.columns}, inplace=True)
-            if "Symbol" in df.columns and "Ticker" not in df.columns:
-                df.rename(columns={"Symbol": "Ticker"}, inplace=True)
-            if "Security" in df.columns and "Name" not in df.columns:
-                df.rename(columns={"Security": "Name"}, inplace=True)
-            if "GICS Sector" in df.columns and "Sector" not in df.columns:
-                df.rename(columns={"GICS Sector": "Sector"}, inplace=True)
-            if "GICS Sub-Industry" in df.columns and "SubIndustry" not in df.columns:
-                df.rename(columns={"GICS Sub-Industry": "SubIndustry"}, inplace=True)
-            keep = [c for c in ["Ticker","Name","Sector","SubIndustry"] if c in df.columns]
-            df = df[keep]
-            df["Ticker"] = df["Ticker"].astype(str).str.replace(".", "-", regex=False).str.upper().str.strip()
-        else:
-            # Last resort: empty schema
-            return pd.DataFrame(columns=["Ticker","Name","Sector","SubIndustry"])
+def _chunk(lst: List[str], size: int) -> List[List[str]]:
+    return [lst[i:i+size] for i in range(0, len(lst), size)]
 
-    # Persist cache/meta and return
-    try:
-        df.to_csv(TICKERS_CSV, index=False)
-    except Exception:
-        pass
-    try:
-        df.to_parquet(META_PARQUET, index=False)
-    except Exception:
-        pass
+def _log(msg: str):
+    print(msg, flush=True)
+
+def _safe_concat_price_frames(frames: List[pd.DataFrame]) -> pd.DataFrame:
+    frames = [f for f in frames if isinstance(f, pd.DataFrame) and not f.empty]
+    if not frames:
+        return pd.DataFrame()
+    # frames from yfinance are wide with one column per symbol
+    df = pd.concat(frames, axis=1)
+    # ensure DateTimeIndex
+    df.index = pd.to_datetime(df.index, errors="coerce")
+    df = df[~df.index.isna()]
+    # sort, drop full-null cols
+    df = df.sort_index()
+    df = df.dropna(axis=1, how="all")
     return df
 
+# ---------------------- S&P500 Constituents ----------------------
+# If you already have this in another file, keep using that. Minimal impl here:
 
-def _download_one_yf(ticker: str, start=None, end=None) -> pd.Series:
-    """Single-symbol fallback using Ticker.history(). Returns a Close/Adj Close Series or empty."""
-    try:
-        hist = yf.Ticker(ticker).history(
-            start=start, end=end, interval="1d", auto_adjust=True, actions=False
-        )
-        if hist is None or hist.empty:
-            return pd.Series(dtype=float, name=ticker)
-        s = hist.get("Close")
-        if s is None:
-            s = hist.get("Adj Close")
-        if s is None or s.empty:
-            return pd.Series(dtype=float, name=ticker)
-        s.name = ticker
-        return s
-    except Exception:
-        return pd.Series(dtype=float, name=ticker)
+_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+_SP500_CACHE = os.path.join(DATA_DIR, "sp500_constituents.parquet")
 
-def _download_chunk(tickers: list[str], start=None, end=None) -> pd.DataFrame:
+def get_sp500_constituents(force_refresh: bool=False) -> pd.DataFrame:
+    if os.path.exists(_SP500_CACHE) and not force_refresh:
+        try:
+            return pd.read_parquet(_SP500_CACHE)
+        except Exception:
+            pass
+    _log("[fetch_data] Refreshing S&P500 list from Wikipedia…")
+    tables = pd.read_html(_WIKI_URL)
+    df = tables[0].rename(columns={"Symbol": "Ticker", "Security": "Name"})
+    df["Ticker"] = df["Ticker"].astype(str).str.strip()
+    df.to_parquet(_SP500_CACHE, index=False)
+    return df[["Ticker","Name","GICS Sector","GICS Sub-Industry"]].rename(
+        columns={"GICS Sector":"Sector","GICS Sub-Industry":"SubIndustry"}
+    )
+
+# ---------------------- Robust equity downloader ----------------------
+
+def _download_chunk_multi(tickers: List[str], start=None, end=None) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Multi -> per-ticker fallback with retries.
-    Returns a wide DataFrame (Adj Close/Close) indexed by date.
+    Try yf.download on a chunk (multi). Returns (wide_df, failed_symbols).
+    Falls back to per-ticker on partial failures.
     """
-    tickers = [t for t in tickers if t]
+    failed = []
     if not tickers:
-        return pd.DataFrame()
+        return pd.DataFrame(), failed
 
-    # --- 1) Try multi-download first (threads=False is more stable on Streamlit Cloud)
-    ok: dict[str, pd.Series] = {}
+    # Multi try
     try:
-        data = yf.download(
-            tickers,
+        df = yf.download(
+            tickers=" ".join(tickers),
             start=start, end=end,
-            interval="1d", auto_adjust=True,
-            group_by="ticker", threads=False,
+            group_by="ticker",
+            auto_adjust=True,
             progress=False,
+            threads=False
         )
-        if isinstance(data.columns, pd.MultiIndex):
-            for t in tickers:
-                try:
-                    sub = data[t]
-                except Exception:
-                    continue
-                s = sub.get("Adj Close", sub.get("Close"))
-                if s is not None and not s.empty:
-                    s = s.dropna()
-                    if not s.empty:
-                        s.name = t
-                        ok[t] = s
-        else:
-            # single-symbol return shape
-            col = "Adj Close" if "Adj Close" in data.columns else ("Close" if "Close" in data.columns else None)
-            if col:
-                s = data[col].dropna()
-                if not s.empty:
-                    s.name = tickers[0]
-                    ok[tickers[0]] = s
-    except Exception:
-        # fall through to per-ticker path
-        pass
+        # yfinance multi-format normalization to wide 1-col (Close) if needed
+        frames = []
+        for sym in tickers:
+            try:
+                sub = df[sym] if isinstance(df.columns, pd.MultiIndex) else df
+                # prefer 'Adj Close' then 'Close'
+                col = "Adj Close" if "Adj Close" in sub.columns else "Close" if "Close" in sub.columns else None
+                if col is None:
+                    failed.append(sym); continue
+                series = sub[col].rename(sym)
+                frames.append(series.to_frame())
+            except Exception:
+                failed.append(sym)
+        return _safe_concat_price_frames(frames), failed
+    except Exception as e:
+        _log(f"[fetch_data] multi-chunk error ({len(tickers)}): {e!r}")
+        # fall back to per-ticker below
 
-    # --- 2) Per-ticker fallback for any misses with retries + backoff + jitter
-    missing = [t for t in tickers if t not in ok]
-    for t in missing:
-        for k in range(3):
-            s = _download_one_yf(t, start=start, end=end)
-            if not s.empty:
-                ok[t] = s
-                break
-            time.sleep((0.6 * (2 ** k)) + random.random() * 0.4)
+    # Per ticker fallback for the whole chunk
+    frames = []
+    for sym in tickers:
+        try:
+            t = yf.Ticker(sym)
+            hist = t.history(start=start, end=end, auto_adjust=True)
+            if hist is None or hist.empty:
+                failed.append(sym); continue
+            col = "Close" if "Close" in hist.columns else None
+            if col is None:
+                failed.append(sym); continue
+            frames.append(hist[col].rename(sym).to_frame())
+        except Exception as e:
+            failed.append(sym)
+    return _safe_concat_price_frames(frames), failed
 
-    if not ok:
+
+def download_prices(
+    symbols: Iterable[str],
+    start: Optional[pd.Timestamp]=None,
+    end: Optional[pd.Timestamp]=None,
+    force_refresh: bool=False,
+    chunk_size: int=25,
+    max_retries: int=3,
+    backoff_base: float=0.8
+) -> pd.DataFrame:
+    """
+    Wide DataFrame of prices (auto-adjusted close), columns=tickers.
+    Uses on-disk cache unless `force_refresh` is True.
+    """
+    symbols = _sanitize_symbols(list(symbols))
+    if not symbols:
         return pd.DataFrame()
 
-    out = pd.concat(ok.values(), axis=1).sort_index()
-    out.columns = [str(c).upper().strip() for c in out.columns]
-    out.index = pd.to_datetime(out.index).tz_localize(None)
-    out = out.dropna(how="all", axis=1)
-    return out
-
-def download_prices(tickers, start=None, end=None, force_refresh: bool = False) -> pd.DataFrame:
-    """
-    Robust multi-ticker downloader with chunking + retries.
-    Returns a wide DataFrame of prices (Adj Close if available), indexed by date.
-    """
-    tickers = [t.replace(".", "-").upper().strip() for t in list(tickers or [])]
-    if not tickers:
-        return pd.DataFrame()
-
-    # Serve cached parquet if suitable
+    # Serve cache if available and not forcing refresh
     if os.path.exists(PRICES_PARQUET) and not force_refresh:
         try:
-            prices = pd.read_parquet(PRICES_PARQUET)
-            prices.index = pd.to_datetime(prices.index).tz_localize(None)
-            prices = prices.sort_index()
-            if start:
-                prices = prices[prices.index >= pd.to_datetime(start)]
-            if end:
-                prices = prices[prices.index <= pd.to_datetime(end)]
-            if not prices.empty:
-                return prices
-        except Exception:
-            pass
+            cached = pd.read_parquet(PRICES_PARQUET)
+            # if we requested a window, trim here
+            if start is not None:
+                cached = cached[cached.index >= pd.to_datetime(start)]
+            if end is not None:
+                cached = cached[cached.index <= pd.to_datetime(end)]
+            if not cached.empty:
+                _log(f"[fetch_data] Served {cached.shape[1]} tickers from cache.")
+                return cached
+        except Exception as e:
+            _log(f"[fetch_data] cache read failed: {e!r}")
 
-    if start is None:
-        start = trading_days_ago(400).date()
+    # Fresh download (chunked + retries)
+    all_frames = []
+    all_failed: List[str] = []
+    chunks = _chunk(symbols, chunk_size)
 
-    CHUNK = 10
-    parts = []
-    tickers = list(dict.fromkeys(tickers))  # de-dup preserving order
-    for i in range(0, len(tickers), CHUNK):
-        chunk = tickers[i:i+CHUNK]
-        last_exc = None
-        for attempt in range(3):
-            try:
-                part = _download_chunk(chunk, start=start, end=end)
-                if not part.empty:
-                    parts.append(part)
+    for i, chunk in enumerate(chunks, 1):
+        attempt = 0
+        while attempt <= max_retries:
+            df, failed = _download_chunk_multi(chunk, start, end)
+            # If we got any data, accept (even with partial fails)
+            if not df.empty or not failed:
+                if not df.empty:
+                    all_frames.append(df)
+                all_failed.extend(failed)
                 break
-            except Exception as e:
-                last_exc = e
-                time.sleep(1.0 * (attempt + 1))
-        # small courtesy delay for rate-limits
-        time.sleep(0.5 + random.random() * 0.3)
-    if not parts:
-        return pd.DataFrame()
+            # else: full failure for this chunk — backoff and retry
+            attempt += 1
+            sleep_s = backoff_base * (2 ** (attempt - 1))
+            _log(f"[fetch_data] chunk {i}/{len(chunks)} retry {attempt} in {sleep_s:.1f}s…")
+            time.sleep(sleep_s)
 
-    prices = pd.concat(parts, axis=1)
-    prices.index = pd.to_datetime(prices.index).tz_localize(None)
-    prices = prices.sort_index()
-    prices.columns = [str(c).upper().strip() for c in prices.columns]
-    prices = prices.ffill().bfill().dropna(how="all", axis=1)
-    try:
-        prices.to_parquet(PRICES_PARQUET)
-    except Exception:
-        pass
-    return prices
+        # last resort: if still nothing, split the chunk into halves to salvage
+        if attempt > max_retries and df.empty:
+            half = max(1, len(chunk)//2)
+            for sub in _chunk(chunk, half):
+                sub_df, sub_failed = _download_chunk_multi(sub, start, end)
+                if not sub_df.empty:
+                    all_frames.append(sub_df)
+                all_failed.extend(sub_failed)
 
-def download_prices_window(
-    tickers,
-    lookback_trading_days: int,
-    asof: Optional[datetime] = None,
-    force_refresh: bool = False
-) -> pd.DataFrame:
-    """
-    Equity helper: convert trading-day lookback to a calendar window (~1.4x buffer)
-    and fetch prices via `download_prices`.
-    """
-    if asof is None:
-        asof = pd.Timestamp.today(tz="UTC").normalize()
-    cal_days = int(lookback_trading_days * 1.4)
-    start = (asof - pd.Timedelta(days=cal_days)).date()
-    end = asof.date()
-    return download_prices(tickers, start=start, end=end, force_refresh=force_refresh)
+    out = _safe_concat_price_frames(all_frames)
 
-def get_meta() -> pd.DataFrame:
-    if os.path.exists(META_PARQUET):
-        return pd.read_parquet(META_PARQUET)
-    return get_sp500_constituents(force_refresh=False)
-
-# ---------------- FX via Alpha Vantage (cached) ----------------
-FX_CACHE = pathlib.Path(__file__).resolve().parent.parent / "data" / "fx_av"
-FX_CACHE.mkdir(parents=True, exist_ok=True)
-
-def _fx_cache_path(pair: str) -> pathlib.Path:
-  return FX_CACHE / f"{pair}.parquet"
-
-# Single canonical parquet for fast Yahoo Finance multi-symbol cache
-FX_YF_PARQUET = FX_CACHE / "fx_yf_daily.parquet"
-
-def _pairs_to_yf_symbols(pairs: list[str]) -> list[str]:
-  """Map pairs like 'EURUSD' or 'EUR/USD' to yfinance symbols like 'EURUSD=X'."""
-  syms: list[str] = []
-  for p in pairs:
-    p = p.upper().replace('/', '')
-    if len(p) >= 6:
-      syms.append(f"{p}=X")
-  return syms
-
-def _av_get_fx_daily(pair: str, api_key: str, outputsize: str = "full") -> pd.Series:
-  """
-  Returns a pandas Series of close prices indexed by datetime.
-  pair format: 'EURUSD'. Uses Alpha Vantage FX_DAILY.
-  """
-  p = _fx_cache_path(pair)
-  if p.exists():
-    return pd.read_parquet(p)["close"]
-
-  base, quote = pair[:3], pair[3:]
-  url = (
-    "https://www.alphavantage.co/query"
-    f"?function=FX_DAILY&from_symbol={base}&to_symbol={quote}&outputsize={outputsize}&apikey={api_key}"
-  )
-  last_exc = None
-  for i in range(3):
-      try:
-          r = _HTTP.get(url, timeout=30)
-          r.raise_for_status()
-          data = r.json()
-          break
-      except Exception as e:
-          last_exc = e
-          time.sleep(2 * (i + 1))
-  else:
-      raise RuntimeError(f"Alpha Vantage request failed for {pair}: {last_exc}")
-  if "Time Series FX (Daily)" not in data:
-    raise RuntimeError(
-      f"Alpha Vantage error for {pair}: {data.get('Note') or data.get('Error Message') or 'unknown'}"
-    )
-  ts = data["Time Series FX (Daily)"]
-  s = pd.Series({pd.to_datetime(k): float(v["4. close"]) for k, v in ts.items()}).sort_index()
-  df = pd.DataFrame({"close": s})
-  df.to_parquet(p, index=True)
-  return s
-
-# -------------- Fast FX downloader preferring Yahoo, fallback to Alpha Vantage --------------
-def download_prices_fx_fast(
-    pairs: list[str],
-    start: Optional[datetime] = None,
-    end: Optional[datetime] = None,
-    force_refresh: bool = False
-) -> pd.DataFrame:
-    """
-    Fast FX downloader:
-    1) Try Yahoo Finance multi-download for all requested pairs in one call.
-    2) Persist/merge into a single canonical parquet (FX_YF_PARQUET).
-    3) Fall back to Alpha Vantage for any pairs Yahoo misses, and merge results.
-
-    If `start`/`end` are not provided, defaults to ~2 years of history to
-    ensure enough data for rolling indicators, Sharpe, etc.
-    Returns wide DataFrame indexed by date with columns = requested pairs (close).
-    """
-    # Optionally drop cache if forced
-    if force_refresh and FX_YF_PARQUET.exists():
+    # Merge with existing cache so we don’t lose old columns
+    if os.path.exists(PRICES_PARQUET):
         try:
-            FX_YF_PARQUET.unlink()
+            base = pd.read_parquet(PRICES_PARQUET)
+            out = base.combine_first(out).combine_first(out)  # keep most complete shape
         except Exception:
             pass
 
-    # Default window if not specified: ~2 years
-    yf_kwargs = {}
-    if start is None and end is None:
-        yf_kwargs["period"] = "2y"
-    else:
-        if start is not None:
-            yf_kwargs["start"] = pd.to_datetime(start)
-        if end is not None:
-            yf_kwargs["end"] = pd.to_datetime(end)
-
-    # 1) Yahoo Finance bulk download
-    symbols = _pairs_to_yf_symbols(pairs)
-    base = pd.DataFrame()
-    if symbols:
-        data = yf.download(
-            symbols,
-            interval="1d",
-            auto_adjust=False,
-            group_by="ticker",
-            progress=False,
-            threads=True,
-            **yf_kwargs
-        )
-        close = pd.DataFrame()
-        if isinstance(data.columns, pd.MultiIndex):
-            try:
-                close = data.xs("Close", axis=1, level=1, drop_level=True)
-            except Exception:
-                close = data.xs("close", axis=1, level=1, drop_level=True)
-            close.columns = [c.replace("=X", "") for c in close.columns]
-        else:
-            # Single symbol case
-            if "Close" in data.columns:
-                close = data[["Close"]].copy()
-            elif "close" in data.columns:
-                close = data[["close"]].copy()
-            else:
-                close = pd.DataFrame()
-            if len(symbols) == 1 and not close.empty:
-                close.columns = [symbols[0].replace("=X", "")]
-
-        close = close.sort_index().dropna(how="all")
-
-        # Merge with existing YF cache if present
-        if FX_YF_PARQUET.exists():
-            try:
-                old = pd.read_parquet(FX_YF_PARQUET)
-                close = old.combine_first(close).combine_first(old)
-            except Exception:
-                pass
-
-        if not close.empty:
-            try:
-                close.to_parquet(FX_YF_PARQUET, index=True)
-            except Exception:
-                pass
-            base = close
-
-    # 2) Identify missing pairs not covered by Yahoo
-    missing = [p for p in pairs if base.empty or p not in base.columns]
-
-    if missing:
-        # 3) Fall back to Alpha Vantage for the leftovers (cached per pair with rate limiting)
-        av_df = download_prices_fx(missing, force_refresh=force_refresh)
-        base = base.join(av_df, how="outer") if not base.empty else av_df
-        # persist merged set back to canonical cache
+    if not out.empty:
         try:
-            if FX_YF_PARQUET.exists():
-                old = pd.read_parquet(FX_YF_PARQUET)
-                merged = old.combine_first(base).combine_first(old)
-            else:
-                merged = base
-            merged.to_parquet(FX_YF_PARQUET, index=True)
-        except Exception:
-            pass
+            out.to_parquet(PRICES_PARQUET)
+        except Exception as e:
+            _log(f"[fetch_data] cache write failed: {e!r}")
 
-    out = base.reindex(columns=pairs).sort_index() if not base.empty else pd.DataFrame(columns=pairs)
-    out.index = pd.to_datetime(out.index).tz_localize(None)
+    # Final trims on requested window
+    if start is not None:
+        out = out[out.index >= pd.to_datetime(start)]
+    if end is not None:
+        out = out[out.index <= pd.to_datetime(end)]
+
+    # Log failures succinctly (Streamlit console shows them)
+    failed_unique = sorted(set(all_failed))
+    if failed_unique:
+        _log(f"[fetch_data] Failed downloads ({len(failed_unique)}): {failed_unique[:30]}{' …' if len(failed_unique)>30 else ''}")
+
     return out
 
-def download_prices_fx(pairs: list[str], force_refresh: bool = False, api_key: str | None = None) -> pd.DataFrame:
-  """
-  Returns a DataFrame with columns = pairs (close). Uses caching and simple rate-limit spacing.
-  Requires env var ALPHAVANTAGE_API_KEY.
-  """
-  if not api_key:
-      api_key = os.getenv("ALPHAVANTAGE_API_KEY")
-  if not api_key:
-      raise RuntimeError("ALPHAVANTAGE_API_KEY not set")
+# ---------------------- FX windowed via yfinance (close) ----------------------
 
-  cols: dict[str, pd.Series] = {}
-  calls = 0
-  for pair in pairs:
-    if force_refresh:
-      cp = _fx_cache_path(pair)
-      if cp.exists():
-        cp.unlink()
-    try:
-      cols[pair] = _av_get_fx_daily(pair, api_key)
-      calls += 1
-      if calls % 5 == 0:
-        time.sleep(60)  # ~5 req/min on AV free tier
-    except Exception as e:
-      print(f"[WARN] FX fetch failed for {pair}: {e}")
+def _fx_to_yf_symbol(pair: str) -> str:
+    # EURUSD -> EURUSD=X, USDJPY -> USDJPY=X
+    s = str(pair).strip().upper().replace("/", "")
+    return f"{s}=X"
 
-  if not cols:
-    raise RuntimeError("No FX data retrieved")
-
-  df = pd.DataFrame(cols).sort_index()
-  df.index = pd.to_datetime(df.index).tz_localize(None)
-  return df
-
-
-# ----- Helper to fetch FX window using trading-day lookback and as-of -----
 def download_prices_fx_window(
-    pairs: list[str],
+    pairs: List[str],
     lookback_trading_days: int,
-    asof: Optional[datetime] = None,
-    force_refresh: bool = False
+    asof: pd.Timestamp,
+    force_refresh: bool=False,
+    chunk_size: int=25
 ) -> pd.DataFrame:
     """
-    Convenience wrapper that converts a trading-day lookback to a calendar window (~1.4x buffer)
-    and fetches FX prices using the fast Yahoo-first path with Alpha Vantage fallback.
+    Windowed FX fetch using yfinance (close). Returns wide DF columns=pairs.
     """
-    if asof is None:
-        asof = pd.Timestamp.today(tz="UTC").normalize()
-    # Convert trading-day lookback to calendar days with a buffer
-    cal_days = int(lookback_trading_days * 1.4)
-    start = (asof - pd.Timedelta(days=cal_days)).date()
-    end = asof.date()
-    return download_prices_fx_fast(pairs, start=start, end=end, force_refresh=force_refresh)
+    yf_syms = [_fx_to_yf_symbol(p) for p in pairs]
+    end = pd.Timestamp(asof).normalize()
+    # Use business days as in dashboard:
+    from pandas.tseries.offsets import BDay
+    start = (end - BDay(int(lookback_trading_days))).normalize()
+
+    df = download_prices(yf_syms, start=start, end=end, force_refresh=force_refresh, chunk_size=chunk_size)
+
+    # Map back columns from 'EURUSD=X' -> 'EURUSD'
+    colmap = {s: s.replace("=X","") for s in df.columns}
+    df = df.rename(columns=colmap)
+
+    # Also persist to an FX cache (optional)
+    try:
+        if not df.empty:
+            df.to_parquet(FX_YF_PARQUET)
+    except Exception:
+        pass
+
+    return df
+
+# ---------------------- Meta (placeholder kept for API symmetry) ----------------------
+
+def get_meta() -> Dict[str, str]:
+    # Keep interface stable. Add richer metadata as needed.
+    return {}
