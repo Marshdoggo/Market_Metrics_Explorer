@@ -8,6 +8,11 @@ import numpy as np
 import requests
 import yfinance as yf
 import plotly
+try:
+    # fallback price source
+    import pandas_datareader.data as web  # stooq backend
+except Exception:
+    web = None
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -104,6 +109,7 @@ def _from_local_csv() -> pd.DataFrame:
     out["Name"] = _get("name")
     out["Sector"] = _get("sector")
     out["SubIndustry"] = _get("subindustry")
+    _log(f"[fetch_data] Loaded local S&P500 CSV: {len(out)} tickers")
     return out[["Ticker", "Name", "Sector", "SubIndustry"]]
 
 def get_sp500_constituents(force_refresh: bool=False) -> pd.DataFrame:
@@ -152,6 +158,7 @@ def get_sp500_constituents(force_refresh: bool=False) -> pd.DataFrame:
             ["Ticker", "Name", "GICS Sector", "GICS Sub-Industry"]
         ].rename(columns={"GICS Sector": "Sector", "GICS Sub-Industry": "SubIndustry"})
 
+        _log(f"[fetch_data] Wikipedia list fetched: {len(df)} tickers")
         try:
             df.to_parquet(_SP500_CACHE, index=False)
         except Exception:
@@ -219,6 +226,30 @@ def _download_chunk_multi(tickers: List[str], start=None, end=None) -> Tuple[pd.
         except Exception as e:
             failed.append(sym)
     return _safe_concat_price_frames(frames), failed
+def _download_stooq(symbols: List[str], start=None, end=None) -> pd.DataFrame:
+    """
+    Fallback downloader using Stooq via pandas-datareader (no API key).
+    Returns wide Close-price DataFrame with columns=tickers.
+    """
+    if web is None or not symbols:
+        return pd.DataFrame()
+
+    frames = []
+    for sym in symbols:
+        try:
+            # Stooq wants raw ticker (no '=X', no spaces). We already sanitized.
+            s = sym.replace("=X", "")  # just in case
+            df = web.DataReader(s, "stooq", start=start, end=end)
+            # Stooq returns newest-first; flip to oldest-first
+            df = df.sort_index()
+            if "Close" not in df.columns or df.empty:
+                continue
+            frames.append(df["Close"].rename(sym).to_frame())
+        except Exception:
+            # Ignore and move on — we only use this as a best-effort fallback
+            continue
+
+    return _safe_concat_price_frames(frames)
 
 
 def download_prices(
@@ -226,15 +257,16 @@ def download_prices(
     start: Optional[pd.Timestamp]=None,
     end: Optional[pd.Timestamp]=None,
     force_refresh: bool=False,
-    chunk_size: int=25,
+    chunk_size: int=10,
     max_retries: int=3,
-    backoff_base: float=0.8
+    backoff_base: float=1.0
 ) -> pd.DataFrame:
     """
     Wide DataFrame of prices (auto-adjusted close), columns=tickers.
     Uses on-disk cache unless `force_refresh` is True.
     """
     symbols = _sanitize_symbols(list(symbols))
+    requested_symbols = set(symbols)
     if not symbols:
         return pd.DataFrame()
 
@@ -251,6 +283,10 @@ def download_prices(
                     cached.index = pd.DatetimeIndex(idx[mask]).tz_localize(None)
                 else:
                     cached = pd.DataFrame()
+            # Only keep requested symbols if present
+            if not cached.empty:
+                keep_cols = [c for c in cached.columns if c in requested_symbols]
+                cached = cached[keep_cols] if keep_cols else pd.DataFrame()
             # if we requested a window, trim here (only when index is valid)
             if not cached.empty:
                 if start is not None:
@@ -267,10 +303,12 @@ def download_prices(
     all_frames = []
     all_failed: List[str] = []
     chunks = _chunk(symbols, chunk_size)
+    out = pd.DataFrame()
 
     for i, chunk in enumerate(chunks, 1):
         attempt = 0
         while attempt <= max_retries:
+            df = pd.DataFrame()
             df, failed = _download_chunk_multi(chunk, start, end)
             # If we got any data, accept (even with partial fails)
             if not df.empty or not failed:
@@ -295,11 +333,21 @@ def download_prices(
 
     out = _safe_concat_price_frames(all_frames)
 
-    # Merge with existing cache so we don’t lose old columns
+    # If we’re missing some symbols, try Stooq for the missing ones
+    requested = set(symbols)
+    have = set(out.columns) if not out.empty else set()
+    missing = sorted(requested - have)
+    if missing:
+        _log(f"[fetch_data] Yahoo missing {len(missing)} symbols — trying Stooq fallback…")
+        stooq_df = _download_stooq(missing, start=start, end=end)
+        if not stooq_df.empty:
+            out = _safe_concat_price_frames([out, stooq_df])
+
+    # Merge with existing cache so we don’t lose previously-fetched columns
     if os.path.exists(PRICES_PARQUET):
         try:
             base = pd.read_parquet(PRICES_PARQUET)
-            out = base.combine_first(out).combine_first(out)  # keep most complete shape
+            out = base.combine_first(out).combine_first(out)
         except Exception:
             pass
 
@@ -308,6 +356,13 @@ def download_prices(
             out.to_parquet(PRICES_PARQUET)
         except Exception as e:
             _log(f"[fetch_data] cache write failed: {e!r}")
+
+    # Log succinctly what we still don’t have (after Stooq)
+    have = set(out.columns) if not out.empty else set()
+    still_missing = sorted(requested - have)
+    if still_missing:
+        _log(f"[fetch_data] Failed downloads after fallback ({len(still_missing)}): "
+             f"{still_missing[:30]}{' …' if len(still_missing)>30 else ''}")
 
     # Final trims on requested window (only after ensuring a proper DatetimeIndex)
     if not out.empty:
