@@ -241,27 +241,39 @@ def _download_chunk_multi(tickers: List[str], start=None, end=None) -> Tuple[pd.
 def _download_stooq(symbols: List[str], start=None, end=None) -> pd.DataFrame:
     """
     Fallback downloader using Stooq via pandas-datareader (no API key).
+    Tries multiple symbol encodings (SYM, sym, sym.us).
     Returns wide Close-price DataFrame with columns=tickers.
     """
     if web is None or not symbols:
         return pd.DataFrame()
 
+    def _try_one(sym: str) -> Optional[pd.DataFrame]:
+        # Try symbol encodings that often work with stooq
+        candidates = [sym, sym.lower(), f"{sym.lower()}.us"]
+        for c in candidates:
+            try:
+                df = web.DataReader(c, "stooq", start=start, end=end)
+                if df is None or df.empty:
+                    continue
+                df = df.sort_index()
+                close_col = "Close" if "Close" in df.columns else "close" if "close" in df.columns else None
+                if close_col is None:
+                    continue
+                return df[close_col].rename(sym).to_frame()
+            except Exception:
+                continue
+        return None
+
     frames = []
     for sym in symbols:
-        try:
-            # Stooq wants raw ticker (no '=X', no spaces). We already sanitized.
-            s = sym.replace("=X", "")  # just in case
-            df = web.DataReader(s, "stooq", start=start, end=end)
-            # Stooq returns newest-first; flip to oldest-first
-            df = df.sort_index()
-            if "Close" not in df.columns or df.empty:
-                continue
-            frames.append(df["Close"].rename(sym).to_frame())
-        except Exception:
-            # Ignore and move on — we only use this as a best-effort fallback
-            continue
+        got = _try_one(sym.replace("=X", ""))
+        if got is not None and not got.empty:
+            frames.append(got)
 
-    return _safe_concat_price_frames(frames)
+    out = _safe_concat_price_frames(frames)
+    if not out.empty:
+        _log(f"[fetch_data] Stooq delivered {out.shape[1]} / {len(symbols)} symbols.")
+    return out
 
 
 def download_prices(
@@ -322,28 +334,48 @@ def download_prices(
 
     for i, chunk in enumerate(chunks, 1):
         attempt = 0
+        yahoo_ok = False
+        df = pd.DataFrame()
         while attempt <= max_retries:
-            df = pd.DataFrame()
             df, failed = _download_chunk_multi(chunk, start, end)
-            # If we got any data, accept (even with partial fails)
-            if not df.empty or not failed:
-                if not df.empty:
-                    all_frames.append(df)
+            # If Yahoo returned at least some columns, accept and move on
+            if not df.empty:
+                all_frames.append(df)
                 all_failed.extend(failed)
+                yahoo_ok = True
                 break
-            # else: full failure for this chunk — backoff and retry
-            attempt += 1
-            sleep_s = backoff_base * (2 ** (attempt - 1))
-            _log(f"[fetch_data] chunk {i}/{len(chunks)} retry {attempt} in {sleep_s:.1f}s…")
-            time.sleep(sleep_s)
 
-        # last resort: if still nothing, split the chunk into halves to salvage
-        if attempt > max_retries and df.empty:
+            # If Yahoo returned nothing at all, don't keep hammering — try Stooq for the whole chunk
+            _log(f"[fetch_data] chunk {i}/{len(chunks)} got 0 cols from Yahoo; trying Stooq immediately…")
+            stooq_df = _download_stooq(chunk, start=start, end=end)
+            if not stooq_df.empty:
+                all_frames.append(stooq_df)
+                # mark anything Stooq did *not* return as failed
+                missing_from_stooq = sorted(set(chunk) - set(stooq_df.columns))
+                all_failed.extend(missing_from_stooq)
+                yahoo_ok = True
+                break
+
+            # Neither Yahoo nor Stooq gave us anything; backoff and retry Yahoo a bit
+            attempt += 1
+            if attempt <= max_retries:
+                sleep_s = backoff_base * (2 ** (attempt - 1))
+                _log(f"[fetch_data] chunk {i}/{len(chunks)} retry {attempt} in {sleep_s:.1f}s…")
+                time.sleep(sleep_s)
+
+        # If after retries we still have nothing, try splitting the chunk to salvage a few
+        if not yahoo_ok and df.empty:
             half = max(1, len(chunk)//2)
             for sub in _chunk(chunk, half):
                 sub_df, sub_failed = _download_chunk_multi(sub, start, end)
                 if not sub_df.empty:
                     all_frames.append(sub_df)
+                else:
+                    # last-ditch Stooq per-sub
+                    st_sub = _download_stooq(sub, start=start, end=end)
+                    if not st_sub.empty:
+                        all_frames.append(st_sub)
+                        sub_failed = sorted(set(sub) - set(st_sub.columns))
                 all_failed.extend(sub_failed)
 
     out = _safe_concat_price_frames(all_frames)
