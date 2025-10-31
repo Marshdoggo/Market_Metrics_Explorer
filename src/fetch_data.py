@@ -3,6 +3,7 @@ from __future__ import annotations
 import os, io, time, json, math, textwrap
 from typing import List, Iterable, Tuple, Optional, Dict
 
+
 import pandas as pd
 import numpy as np
 import requests
@@ -13,6 +14,14 @@ try:
     import pandas_datareader.data as web  # stooq backend
 except Exception:
     web = None
+
+# Runtime/environment toggles (safer defaults on Streamlit Cloud)
+RUNNING_IN_CLOUD = os.getenv("STREAMLIT_SERVER_ENABLED") == "1" or os.getenv("STREAMLIT_RUNTIME") == "1"
+PREFER_STOOQ_DEFAULT = (
+    os.getenv("MKTME_PREFER_STOOQ", "").lower() in ("1", "true", "yes")
+    or RUNNING_IN_CLOUD
+)
+MAX_SYMBOLS_DEFAULT = int(os.getenv("MKTME_MAX_SYMBOLS", "0") or 0)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -283,7 +292,8 @@ def download_prices(
     force_refresh: bool=False,
     chunk_size: int=10,
     max_retries: int=3,
-    backoff_base: float=1.0
+    backoff_base: float=1.0,
+    prefer_stooq: Optional[bool]=None,
 ) -> pd.DataFrame:
     """
     Wide DataFrame of prices (auto-adjusted close), columns=tickers.
@@ -296,6 +306,15 @@ def download_prices(
 
     start = _to_naive_ts(start)
     end   = _to_naive_ts(end)
+
+    # Apply environment-driven defaults
+    if prefer_stooq is None:
+        prefer_stooq = PREFER_STOOQ_DEFAULT
+
+    # Optionally cap number of symbols to reduce rate-limit risk on Cloud
+    if MAX_SYMBOLS_DEFAULT > 0 and len(symbols) > MAX_SYMBOLS_DEFAULT:
+        _log(f"[fetch_data] Limiting symbols from {len(symbols)} to {MAX_SYMBOLS_DEFAULT} due to MKTME_MAX_SYMBOLS")
+        symbols = symbols[:MAX_SYMBOLS_DEFAULT]
 
     # Serve cache if available and not forcing refresh
     if os.path.exists(PRICES_PARQUET) and not force_refresh:
@@ -326,6 +345,50 @@ def download_prices(
         except Exception as e:
             _log(f"[fetch_data] cache read failed: {e!r}")
 
+    # --- Early path: Stooq-only mode (default on Streamlit Cloud) ---
+    if prefer_stooq:
+        frames = []
+        for i, chunk in enumerate(_chunk(symbols, chunk_size), 1):
+            st_df = _download_stooq(chunk, start=start, end=end)
+            if not st_df.empty:
+                frames.append(st_df)
+                # Write progressive cache so subsequent runs can reuse partial data
+                try:
+                    partial = _safe_concat_price_frames(frames)
+                    if os.path.exists(PRICES_PARQUET):
+                        base = pd.read_parquet(PRICES_PARQUET)
+                        partial = base.combine_first(partial).combine_first(partial)
+                    partial.to_parquet(PRICES_PARQUET)
+                except Exception:
+                    pass
+        out = _safe_concat_price_frames(frames)
+
+        # Merge with existing cache so we don’t lose previously-fetched columns
+        if os.path.exists(PRICES_PARQUET):
+            try:
+                base = pd.read_parquet(PRICES_PARQUET)
+                out = base.combine_first(out).combine_first(out)
+            except Exception:
+                pass
+
+        # Final trims on requested window
+        if not out.empty:
+            idx = pd.to_datetime(out.index, errors="coerce")
+            mask = ~pd.isna(idx)
+            if mask.any():
+                out = out.loc[mask]
+                out.index = pd.DatetimeIndex(idx[mask]).tz_localize(None)
+                if start is not None:
+                    out = out[out.index >= start]
+                if end is not None:
+                    out = out[out.index <= end]
+
+        have = set(out.columns) if not out.empty else set()
+        still_missing = sorted(set(symbols) - have)
+        if still_missing:
+            _log(f"[fetch_data] (stooq-only) Still missing {len(still_missing)} tickers; examples: {still_missing[:30]}{' …' if len(still_missing)>30 else ''}")
+        return out
+
     # Fresh download (chunked + retries)
     all_frames = []
     all_failed: List[str] = []
@@ -341,6 +404,15 @@ def download_prices(
             # If Yahoo returned at least some columns, accept and move on
             if not df.empty:
                 all_frames.append(df)
+                # Progressive cache write for partial progress on Cloud
+                try:
+                    partial = _safe_concat_price_frames(all_frames)
+                    if os.path.exists(PRICES_PARQUET):
+                        base = pd.read_parquet(PRICES_PARQUET)
+                        partial = base.combine_first(partial).combine_first(partial)
+                    partial.to_parquet(PRICES_PARQUET)
+                except Exception:
+                    pass
                 all_failed.extend(failed)
                 yahoo_ok = True
                 break
@@ -350,6 +422,15 @@ def download_prices(
             stooq_df = _download_stooq(chunk, start=start, end=end)
             if not stooq_df.empty:
                 all_frames.append(stooq_df)
+                # Progressive cache write for partial progress on Cloud
+                try:
+                    partial = _safe_concat_price_frames(all_frames)
+                    if os.path.exists(PRICES_PARQUET):
+                        base = pd.read_parquet(PRICES_PARQUET)
+                        partial = base.combine_first(partial).combine_first(partial)
+                    partial.to_parquet(PRICES_PARQUET)
+                except Exception:
+                    pass
                 # mark anything Stooq did *not* return as failed
                 missing_from_stooq = sorted(set(chunk) - set(stooq_df.columns))
                 all_failed.extend(missing_from_stooq)
@@ -370,11 +451,29 @@ def download_prices(
                 sub_df, sub_failed = _download_chunk_multi(sub, start, end)
                 if not sub_df.empty:
                     all_frames.append(sub_df)
+                    # Progressive cache write for partial progress on Cloud
+                    try:
+                        partial = _safe_concat_price_frames(all_frames)
+                        if os.path.exists(PRICES_PARQUET):
+                            base = pd.read_parquet(PRICES_PARQUET)
+                            partial = base.combine_first(partial).combine_first(partial)
+                        partial.to_parquet(PRICES_PARQUET)
+                    except Exception:
+                        pass
                 else:
                     # last-ditch Stooq per-sub
                     st_sub = _download_stooq(sub, start=start, end=end)
                     if not st_sub.empty:
                         all_frames.append(st_sub)
+                        # Progressive cache write for partial progress on Cloud
+                        try:
+                            partial = _safe_concat_price_frames(all_frames)
+                            if os.path.exists(PRICES_PARQUET):
+                                base = pd.read_parquet(PRICES_PARQUET)
+                                partial = base.combine_first(partial).combine_first(partial)
+                            partial.to_parquet(PRICES_PARQUET)
+                        except Exception:
+                            pass
                         sub_failed = sorted(set(sub) - set(st_sub.columns))
                 all_failed.extend(sub_failed)
 
