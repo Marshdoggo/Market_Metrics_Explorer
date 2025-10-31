@@ -19,7 +19,11 @@ from metrics_registry import METRICS
 from metric_docs import METRIC_META, get_pair_guide
 from plot_metrics import scatter_xy
 from universes import get_universe
+
 from utils import parse_tickers
+
+# Default: prefer Stooq if toggled via Streamlit secrets / environment
+PREFER_STOOQ_DEFAULT = str(os.environ.get("MKTME_PREFER_STOOQ", "0")).strip().lower() in ("1", "true", "yes")
 
 # --- Helper: safe date bounds for Streamlit date_input -------------------------
 def _safe_date_bounds(prices):
@@ -52,6 +56,7 @@ with st.sidebar:
     lookback = st.number_input('Lookback (trading days)', min_value=60, max_value=2520, value=252, step=21)
     refresh_tickers = st.checkbox('Refresh universe list (Wikipedia/Local)')
     refresh_prices = st.checkbox('Refresh price cache')
+    prefer_stooq = st.checkbox('Prefer Stooq (faster; use if Yahoo rate-limits)', value=PREFER_STOOQ_DEFAULT)
     interactive = st.checkbox('Interactive chart (Plotly)', value=True)
     query = st.text_input('Highlight tickers (comma-separated)', value='', placeholder='AAPL, MSFT, NVDA  •  or  EURUSD, USDJPY')
     st.caption('Data by Wikipedia (equities), yfinance (equity prices), Alpha Vantage (FX).')
@@ -106,6 +111,7 @@ else:
             start=start,
             end=end,
             force_refresh=refresh_prices,
+            prefer_stooq=prefer_stooq,
         )
     # Robust fallback if cache was empty or failed
     if prices is None or getattr(prices, "empty", True):
@@ -116,6 +122,7 @@ else:
                     start=start,
                     end=end,
                     force_refresh=True,
+                    prefer_stooq=prefer_stooq,
                 )
         # If still empty, stop early with a helpful message
         if prices is None or getattr(prices, "empty", True):
