@@ -1,5 +1,5 @@
 import os
-os.system("pip install yfinance beautifulsoup4 html5lib --quiet")
+os.system("pip install yfinance beautifulsoup4 html5lib requests pyarrow --quiet")
 
 import sys
 sys.path.append(os.path.dirname(__file__))  # ensure src/ is on sys.path
@@ -20,7 +20,45 @@ from metric_docs import METRIC_META, get_pair_guide
 from plot_metrics import scatter_xy
 from universes import get_universe
 
+
 from utils import parse_tickers
+
+# --- Manifest/Parquet loader (prefer external loader.py; fallback to inline) ----
+try:
+    from loader import get_prices_for_universe  # provided by src/loader.py
+except Exception:
+    # Inline fallback so the app still runs if loader.py is missing
+    import json
+    import requests
+    from io import BytesIO
+
+    MANIFEST_URL = os.environ.get(
+        "MKTME_MANIFEST_URL",
+        "https://raw.githubusercontent.com/REPLACE_ME_USER/mktme-data/main/manifest.json"
+    )
+
+    @st.cache_data(ttl=60*60)
+    def _load_manifest():
+        r = requests.get(MANIFEST_URL, timeout=30)
+        r.raise_for_status()
+        return json.loads(r.text)
+
+    @st.cache_data(ttl=60*60)
+    def _load_parquet_http(url: str) -> pd.DataFrame:
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
+        df = pd.read_parquet(BytesIO(r.content), engine="pyarrow")
+        # Ensure UTC datetime index
+        df.index = pd.to_datetime(df.index, utc=True)
+        return df
+
+    def get_prices_for_universe(universe: str) -> pd.DataFrame:
+        m = _load_manifest()
+        if "universes" not in m or universe not in m["universes"]:
+            raise RuntimeError(f"Universe '{universe}' not present in manifest at {MANIFEST_URL}")
+        url = m["universes"][universe]["parquet_url"]
+        return _load_parquet_http(url)
+# -------------------------------------------------------------------------------
 
 # Default: prefer Stooq if toggled via Streamlit secrets / environment
 PREFER_STOOQ_DEFAULT = str(os.environ.get("MKTME_PREFER_STOOQ", "0")).strip().lower() in ("1", "true", "yes")
@@ -59,7 +97,7 @@ with st.sidebar:
     prefer_stooq = st.checkbox('Prefer Stooq (faster; use if Yahoo rate-limits)', value=PREFER_STOOQ_DEFAULT)
     interactive = st.checkbox('Interactive chart (Plotly)', value=True)
     query = st.text_input('Highlight tickers (comma-separated)', value='', placeholder='AAPL, MSFT, NVDA  •  or  EURUSD, USDJPY')
-    st.caption('Data by Wikipedia (equities), yfinance (equity prices), Alpha Vantage (FX).')
+    st.caption('Data by Wikipedia (equities) and local publisher → Parquet (served via GitHub Raw).')
 
 if universe == 'sp500':
     tickers_df = get_sp500_constituents(force_refresh=refresh_tickers)
@@ -67,67 +105,24 @@ else:
     tickers_df = get_universe(universe, force_refresh=refresh_tickers)
 meta = get_meta() if universe != 'fx' else {}
 
-if universe == 'fx':
-    # Windowed FX fetch so we only pull what we need for the selected lookback/as-of
-    from fetch_data import download_prices_fx_window
-    pairs = tickers_df['Ticker'].tolist()
-    # Use today for the initial as-of (actual slider/as-of control comes right after this
-    # and all downstream metrics use the returned `prices` range).
-    asof_seed = pd.Timestamp.today(tz='UTC')
-    with st.spinner('Loading FX prices (windowed)…'):
-        prices = download_prices_fx_window(
-            pairs,
-            lookback_trading_days=int(lookback),
-            asof=asof_seed,
-            force_refresh=refresh_prices,
-        )
-    # Robust fallback if cache was empty or failed
-    if prices is None or getattr(prices, "empty", True):
-        if not refresh_prices:
-            with st.spinner("No FX prices found in cache. Forcing a fresh fetch…"):
-                prices = download_prices_fx_window(
-                    pairs,
-                    lookback_trading_days=int(lookback),
-                    asof=asof_seed,
-                    force_refresh=True,
-                )
-        # If still empty, stop early with a helpful message
-        if prices is None or getattr(prices, "empty", True):
-            st.error("No FX price data available after refresh. Please try again in a minute (rate limit) or toggle 'Refresh price cache'.")
-            st.stop()
-else:
-    # Equities (non-FX) block: fetch prices for the given lookback and as-of.
-    from pandas.tseries.offsets import BDay
+# --- Load cached prices from manifest/Parquet -------------------------------
+with st.spinner('Loading cached prices…'):
+    try:
+        prices_full = get_prices_for_universe(universe)
+    except Exception as e:
+        st.error(f"Failed to load dataset for universe '{universe}'. {e}")
+        st.stop()
 
-    symbols = tickers_df['Ticker'].tolist()
-    asof_seed = pd.Timestamp.today(tz='UTC')
+# Subset to the universe symbols from the side bar to keep columns aligned
+symbols = tickers_df['Ticker'].astype(str).tolist()
+keep = [c for c in prices_full.columns if c in symbols]
+prices = prices_full[keep].copy()
 
-    with st.spinner('Loading equity prices…'):
-        end = pd.Timestamp(asof_seed).normalize()
-        start = (end - BDay(int(lookback))).normalize()
-
-        prices = download_prices(
-            symbols,
-            start=start,
-            end=end,
-            force_refresh=refresh_prices,
-            prefer_stooq=prefer_stooq,
-        )
-    # Robust fallback if cache was empty or failed
-    if prices is None or getattr(prices, "empty", True):
-        if not refresh_prices:
-            with st.spinner("No equity prices found in cache. Forcing a fresh fetch…"):
-                prices = download_prices(
-                    symbols,
-                    start=start,
-                    end=end,
-                    force_refresh=True,
-                    prefer_stooq=prefer_stooq,
-                )
-        # If still empty, stop early with a helpful message
-        if prices is None or getattr(prices, "empty", True):
-            st.error("No equity price data available after refresh. Please try again in a minute (rate limit) or toggle 'Refresh price cache'.")
-            st.stop()
+if prices is None or getattr(prices, 'empty', True):
+    st.error("No cached price data available for this universe. "
+             "Ensure the data repo published a Parquet file referenced by the manifest.")
+    st.stop()
+# ---------------------------------------------------------------------------
 
 min_day, max_day = _safe_date_bounds(prices)
 

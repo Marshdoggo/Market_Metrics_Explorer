@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import requests
 import yfinance as yf
-import plotly
+#import plotly
 try:
     # fallback price source
     import pandas_datareader.data as web  # stooq backend
