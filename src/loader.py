@@ -6,7 +6,17 @@ DEFAULT_MANIFEST = "https://raw.githubusercontent.com/marshdoggo/mktme-data/main
 MANIFEST_URL = os.environ.get("MKTME_MANIFEST_URL", DEFAULT_MANIFEST)
 
 def _ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
-    df.index = pd.to_datetime(df.index, utc=True)
+    """
+    Make sure the index is a DatetimeIndex, and make it *tz-naive*
+    so it matches the rest of the app's expectations.
+    """
+    idx = pd.to_datetime(df.index)
+
+    # If there's a timezone, strip it off
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+
+    df.index = idx
     return df
 
 def _http_get(url: str, timeout=60):
