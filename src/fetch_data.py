@@ -29,6 +29,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 PRICES_PARQUET = os.path.join(DATA_DIR, "prices.parquet")
 FX_YF_PARQUET  = os.path.join(DATA_DIR, "fx_yf.parquet")
 
+# NEW: allow publisher to force refresh instead of using cache
+FORCE_REFRESH = os.getenv("MKTME_FORCE_REFRESH", "").lower() in ("1", "true", "yes")
+
 # ---------------------- Utilities ----------------------
 
 def _sanitize_symbols(symbols: Iterable[str]) -> List[str]:
@@ -289,7 +292,7 @@ def download_prices(
     symbols: Iterable[str],
     start: Optional[pd.Timestamp]=None,
     end: Optional[pd.Timestamp]=None,
-    force_refresh: bool=False,
+    force_refresh: Optional[bool]=None,
     chunk_size: int=10,
     max_retries: int=3,
     backoff_base: float=1.0,
@@ -297,12 +300,22 @@ def download_prices(
 ) -> pd.DataFrame:
     """
     Wide DataFrame of prices (auto-adjusted close), columns=tickers.
-    Uses on-disk cache unless `force_refresh` is True.
+    Uses the on-disk cache unless `force_refresh` is True or the
+    MKTME_FORCE_REFRESH env toggle is set.
     """
     symbols = _sanitize_symbols(list(symbols))
     requested_symbols = set(symbols)
     if not symbols:
         return pd.DataFrame()
+
+    # Decide whether to bypass the on-disk cache.
+    # Environment variable MKTME_FORCE_REFRESH acts as a global "on" switch,
+    # while the function argument can also turn refresh on explicitly.
+    if force_refresh is None:
+        force_refresh = FORCE_REFRESH
+    else:
+        # Never allow the argument to disable the env flag; only to enable.
+        force_refresh = bool(force_refresh) or FORCE_REFRESH
 
     start = _to_naive_ts(start)
     end   = _to_naive_ts(end)

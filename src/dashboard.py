@@ -34,7 +34,7 @@ except Exception:
 
     MANIFEST_URL = os.environ.get(
         "MKTME_MANIFEST_URL",
-        "https://raw.githubusercontent.com/REPLACE_ME_USER/mktme-data/main/manifest.json"
+        "https://raw.githubusercontent.com/marshdoggo/mktme-data/main/manifest.json"
     )
 
     @st.cache_data(ttl=60*60)
