@@ -205,3 +205,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# --- Ensure universe CSVs are always tracked ---
+!data/cache_universes/
+!data/cache_universes/*.csv
