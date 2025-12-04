@@ -13,6 +13,10 @@ except ImportError:
 import streamlit as st
 import pandas as pd
 from datetime import date
+import matplotlib.pyplot as plt
+from scipy.cluster.hierarchy import linkage, dendrogram
+from scipy.spatial.distance import squareform
+
 from fetch_data import get_sp500_constituents, get_meta
 from compute_metrics import compute_all_metrics
 from metrics_registry import METRICS
@@ -474,6 +478,58 @@ if compare and metrics_df_B is not None and highlight:
         st.markdown('---')
         st.subheader('A → B: Δ for highlighted tickers')
         st.dataframe(out)
+
     else:
         st.markdown('---')
         st.caption('No overlap of highlighted tickers between A and B (or none highlighted).')
+
+# --- Correlation dendrogram for highlighted tickers ---------------------------------
+st.markdown('---')
+st.subheader('Correlation dendrogram (highlighted tickers)')
+
+# We use the A-view snapshot and lookback window to compute correlations.
+if highlight:
+    # Get tickers actually present in the A snapshot
+    hi_rows = metrics_df_A[metrics_df_A['IsHighlighted']].copy()
+    tickers_hi = hi_rows['Ticker'].dropna().astype(str).unique().tolist()
+
+    if len(tickers_hi) < 2:
+        st.caption('Highlight at least two tickers to see a dendrogram.')
+    else:
+        # Slice the price history up to the A-view as-of and last `lookback` days
+        try:
+            pA = prices.loc[:asof_ts].copy()
+            # keep only highlighted columns
+            cols = [t for t in tickers_hi if t in pA.columns]
+            pA = pA[cols]
+            # restrict to most recent `lookback` rows
+            if lookback is not None and lookback > 0 and len(pA) > lookback:
+                pA = pA.tail(lookback)
+
+            # Compute daily returns and correlation matrix
+            rets = pA.pct_change().dropna(how='all')
+            rets = rets.dropna(axis=1, how='all')
+
+            if rets.shape[1] < 2:
+                st.caption('Not enough valid price history for a correlation view.')
+            else:
+                corr = rets.corr()
+                # Convert correlation to distance (1 - corr) and then to condensed form
+                dist = 1 - corr
+                # Ensure diagonals are zero and values finite
+                dist.values[range(len(dist)), range(len(dist))] = 0.0
+                dist_condensed = squareform(dist.values, checks=False)
+
+                Z = linkage(dist_condensed, method='average')
+
+                fig, ax = plt.subplots(figsize=(8, 4))
+                dendrogram(Z, labels=corr.columns.tolist(), leaf_rotation=90, ax=ax)
+                ax.set_ylabel('Distance (1 - correlation)')
+                ax.set_xlabel('Ticker')
+                fig.tight_layout()
+                st.pyplot(fig)
+        except Exception as e:
+            st.caption(f'Could not compute dendrogram: {e}')
+else:
+    st.caption('Type tickers in the highlight box to see a correlation dendrogram.')
+# -------------------------------------------------------------------------------
