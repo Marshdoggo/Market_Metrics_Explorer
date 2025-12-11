@@ -209,3 +209,5 @@ __marimo__/
 # --- Ensure universe CSVs are always tracked ---
 !data/cache_universes/
 !data/cache_universes/*.csv
+
+.streamlit/secrets.toml 
