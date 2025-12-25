@@ -1,0 +1,250 @@
+"""
+ai_report.py
+- Generate a daily market “brief” from the computed metrics dataframe.
+- Output: JSON-friendly dict + Markdown text.
+- Save/load helpers so GitHub Actions can publish reports into the repo.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+import json
+from pathlib import Path
+
+import pandas as pd
+
+
+def _fmt(v: Any, digits: int = 4) -> Optional[float]:
+    try:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        return round(float(v), digits)
+    except Exception:
+        return None
+
+
+def _pick_cols(df: pd.DataFrame, cols: List[str]) -> List[str]:
+    return [c for c in cols if c in df.columns]
+
+
+def _top_n(df: pd.DataFrame, by: str, n: int = 5, ascending: bool = False) -> pd.DataFrame:
+    if by not in df.columns:
+        return df.head(0)
+    out = df.copy()
+    out[by] = pd.to_numeric(out[by], errors="coerce")
+    out = out.sort_values(by=by, ascending=ascending, na_position="last")
+    return out.head(n)
+
+
+def _sector_summary(df: pd.DataFrame, metric: str, n: int = 5) -> Dict[str, Any]:
+    if "Sector" not in df.columns or metric not in df.columns:
+        return {"available": False}
+
+    x = df.copy()
+    x[metric] = pd.to_numeric(x[metric], errors="coerce")
+    g = x.dropna(subset=[metric]).groupby("Sector")[metric].agg(["mean", "median", "count"]).reset_index()
+    if g.empty:
+        return {"available": False}
+
+    best = g.sort_values("mean", ascending=False).head(n)
+    worst = g.sort_values("mean", ascending=True).head(n)
+
+    def _rows(z: pd.DataFrame) -> List[Dict[str, Any]]:
+        out = []
+        for _, r in z.iterrows():
+            out.append({
+                "Sector": r["Sector"],
+                "mean": _fmt(r["mean"], 4),
+                "median": _fmt(r["median"], 4),
+                "count": int(r["count"]),
+            })
+        return out
+
+    return {
+        "available": True,
+        "metric": metric,
+        "best_by_mean": _rows(best),
+        "worst_by_mean": _rows(worst),
+    }
+
+
+@dataclass
+class DailyReport:
+    report: Dict[str, Any]
+    markdown: str
+
+
+def generate_daily_report(
+    metrics_df: pd.DataFrame,
+    universe: str,
+    asof_date: str,
+    lookback: int,
+    primary_rank_metric: str = "Annualized Sharpe",
+    top_n: int = 5,
+) -> DailyReport:
+    """
+    Build a TradingEconomics-style brief from the metrics table.
+
+    - primary_rank_metric controls the “Top names” table.
+    - Includes a few complementary leaderboards + sector summary when possible.
+    """
+    df = metrics_df.copy()
+
+    # Ensure Ticker column exists (some flows might keep index)
+    if "Ticker" not in df.columns:
+        if df.index.name:
+            df = df.reset_index().rename(columns={df.index.name: "Ticker"})
+        else:
+            df = df.reset_index().rename(columns={"index": "Ticker"})
+
+    base_cols = _pick_cols(df, ["Ticker", "Name", "Sector", "SubIndustry"])
+    metric_cols = _pick_cols(df, [
+        primary_rank_metric,
+        "Sortino Ratio",
+        "Mean Daily Return",
+        "Daily Volatility (Std)",
+        "CAGR",
+        "Max Drawdown",
+        "RSI(14)",
+    ])
+
+    # Leaderboards
+    top_primary = _top_n(df, by=primary_rank_metric, n=top_n, ascending=False)
+    top_sortino = _top_n(df, by="Sortino Ratio", n=top_n, ascending=False) if "Sortino Ratio" in df.columns else df.head(0)
+    top_cagr = _top_n(df, by="CAGR", n=top_n, ascending=False) if "CAGR" in df.columns else df.head(0)
+
+    # “Risk” boards: biggest drawdowns (most negative) and highest vol
+    worst_dd = _top_n(df, by="Max Drawdown", n=top_n, ascending=True) if "Max Drawdown" in df.columns else df.head(0)
+    top_vol = _top_n(df, by="Daily Volatility (Std)", n=top_n, ascending=False) if "Daily Volatility (Std)" in df.columns else df.head(0)
+
+    def _rows(x: pd.DataFrame) -> List[Dict[str, Any]]:
+        if x.empty:
+            return []
+        keep = base_cols + metric_cols
+        keep = _pick_cols(x, keep)
+        out = []
+        for _, r in x[keep].iterrows():
+            row: Dict[str, Any] = {}
+            for c in keep:
+                if c in metric_cols:
+                    row[c] = _fmt(r.get(c), 6 if c in ("Mean Daily Return",) else 4)
+                else:
+                    val = r.get(c)
+                    row[c] = None if (isinstance(val, float) and pd.isna(val)) else str(val)
+            out.append(row)
+        return out
+
+    sector_block = _sector_summary(df, metric=primary_rank_metric, n=5)
+
+    report = {
+        "schema_version": 1,
+        "universe": universe,
+        "asof_date": asof_date,
+        "lookback_trading_days": int(lookback),
+        "primary_rank_metric": primary_rank_metric,
+        "leaderboards": {
+            "top_by_primary_metric": _rows(top_primary),
+            "top_by_sortino": _rows(top_sortino),
+            "top_by_cagr": _rows(top_cagr),
+            "worst_by_max_drawdown": _rows(worst_dd),
+            "top_by_volatility": _rows(top_vol),
+        },
+        "sector_summary": sector_block,
+        "notes": [
+            f"Tables are computed from the app's cached price dataset and metrics pipeline.",
+            f"'top_by_primary_metric' is sorted by {primary_rank_metric} descending (higher first).",
+        ],
+    }
+
+    md = _render_markdown(report)
+    return DailyReport(report=report, markdown=md)
+
+
+def _render_markdown(report: Dict[str, Any]) -> str:
+    u = report.get("universe", "?")
+    d = report.get("asof_date", "?")
+    lb = report.get("lookback_trading_days", "?")
+    prim = report.get("primary_rank_metric", "Annualized Sharpe")
+
+    def _md_table(rows: List[Dict[str, Any]], title: str, max_rows: int = 5) -> str:
+        if not rows:
+            return f"### {title}\n\n_(no data)_\n"
+        rows = rows[:max_rows]
+        cols = list(rows[0].keys())
+        lines = [f"### {title}", ""]
+        lines.append("| " + " | ".join(cols) + " |")
+        lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
+        for r in rows:
+            vals = []
+            for c in cols:
+                v = r.get(c)
+                vals.append("" if v is None else str(v))
+            lines.append("| " + " | ".join(vals) + " |")
+        lines.append("")
+        return "\n".join(lines)
+
+    blocks = []
+    blocks.append(f"# Market Metric Explorer — Daily Brief\n")
+    blocks.append(f"- Universe: **{u}**\n- As-of: **{d}**\n- Lookback: **{lb} trading days**\n- Primary rank metric: **{prim}**\n")
+
+    lbs = report.get("leaderboards", {})
+    blocks.append(_md_table(lbs.get("top_by_primary_metric", []), f"Top by {prim}"))
+    if lbs.get("top_by_sortino"):
+        blocks.append(_md_table(lbs.get("top_by_sortino", []), "Top by Sortino Ratio"))
+    if lbs.get("top_by_cagr"):
+        blocks.append(_md_table(lbs.get("top_by_cagr", []), "Top by CAGR"))
+    if lbs.get("worst_by_max_drawdown"):
+        blocks.append(_md_table(lbs.get("worst_by_max_drawdown", []), "Worst by Max Drawdown"))
+    if lbs.get("top_by_volatility"):
+        blocks.append(_md_table(lbs.get("top_by_volatility", []), "Top by Daily Volatility (Std)"))
+
+    sec = report.get("sector_summary", {})
+    if sec.get("available"):
+        blocks.append("## Sector Summary\n")
+        blocks.append(f"Metric: **{sec.get('metric')}**\n")
+        best = sec.get("best_by_mean", [])
+        worst = sec.get("worst_by_mean", [])
+
+        def _sec_table(rows: List[Dict[str, Any]], title: str) -> str:
+            if not rows:
+                return f"### {title}\n\n_(no data)_\n"
+            cols = list(rows[0].keys())
+            lines = [f"### {title}", ""]
+            lines.append("| " + " | ".join(cols) + " |")
+            lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
+            for r in rows:
+                lines.append("| " + " | ".join(str(r.get(c, "")) for c in cols) + " |")
+            lines.append("")
+            return "\n".join(lines)
+
+        blocks.append(_sec_table(best, "Best sectors by mean"))
+        blocks.append(_sec_table(worst, "Worst sectors by mean"))
+
+    notes = report.get("notes", [])
+    if notes:
+        blocks.append("## Notes\n")
+        for n in notes:
+            blocks.append(f"- {n}")
+        blocks.append("")
+
+    return "\n".join(blocks)
+
+
+# ----------------------------- Save / Load -------------------------------------
+
+def save_report_json(report: Dict[str, Any], path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+
+def save_report_markdown(markdown: str, path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(markdown, encoding="utf-8")
+
+
+def load_report_json(path: str | Path) -> Dict[str, Any]:
+    path = Path(path)
+    return json.loads(path.read_text(encoding="utf-8"))

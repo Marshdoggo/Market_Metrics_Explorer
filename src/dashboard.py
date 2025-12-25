@@ -12,6 +12,8 @@ except ImportError:
 
 import streamlit as st
 import pandas as pd
+import json
+import requests
 from datetime import date
 import matplotlib.pyplot as plt
 from scipy.cluster.hierarchy import linkage, dendrogram
@@ -26,55 +28,17 @@ from universes import get_universe
 
 
 
+
 from utils import parse_tickers
 
-# --- OpenAI (chat about the current view) --------------------------------------
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-
-def _get_openai_client():
-    """Create an OpenAI client if the SDK is installed and an API key is available."""
-    if OpenAI is None:
-        return None
-    key = None
-    try:
-        key = st.secrets.get("OPENAI_API_KEY")
-    except Exception:
-        key = None
-    if not key:
-        key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        return None
-    return OpenAI(api_key=key)
-
-# --- Simple in-app rate limiting (per session) ---------------------------------
-from time import time
-
-
-def _rate_limit_ok(max_calls: int = 8, per_seconds: int = 60) -> tuple[bool, str]:
-    now = time()
-    key_ts = "_ai_call_timestamps"
-    ts = st.session_state.get(key_ts, [])
-    ts = [t for t in ts if (now - t) < per_seconds]
-    if len(ts) >= max_calls:
-        retry_in = int(per_seconds - (now - min(ts)))
-        st.session_state[key_ts] = ts
-        return False, f"Rate limit hit: {max_calls}/{per_seconds}s. Try again in ~{max(1, retry_in)}s."
-    ts.append(now)
-    st.session_state[key_ts] = ts
-    return True, ""
-
-
-def _daily_cap_ok(max_calls: int = 80) -> tuple[bool, str]:
-    key_n = "_ai_call_count"
-    n = int(st.session_state.get(key_n, 0))
-    if n >= max_calls:
-        return False, f"Daily cap reached for this session ({max_calls} calls)."
-    st.session_state[key_n] = n + 1
-    return True, ""
+# --- AI helpers (chat + context) -----------------------------------------------
+from ai_context import (
+    get_openai_client,
+    rate_limit_ok,
+    daily_cap_ok,
+    build_view_context_text,
+    ask_ai_about_view,
+)
 # ------------------------------------------------------------------------------
 
 
@@ -272,91 +236,6 @@ def build_metrics_df(prices_full: pd.DataFrame, asof_ts_local: pd.Timestamp) -> 
     return df
 
 
-def build_view_summary(
-    metrics_df_local: pd.DataFrame,
-    prices_local: pd.DataFrame,
-    x_metric: str,
-    y_metric: str,
-    universe: str,
-    asof_ts_local: pd.Timestamp,
-    lookback: int,
-    highlight_tickers_upper: list[str],
-) -> str:
-    """Summarize the current view (scatter + optional dendrogram context) for the LLM."""
-    lines: list[str] = []
-
-    lines.append(f"Universe: {universe}")
-    lines.append(f"As-of date: {asof_ts_local.date().isoformat()}")
-    lines.append(f"Lookback window: {lookback} trading days")
-    lines.append(f"Scatter plot: X = {x_metric}, Y = {y_metric}")
-    lines.append(f"Number of tickers in view: {len(metrics_df_local)}")
-
-    # Basic distribution stats
-    for m in [x_metric, y_metric]:
-        if m in metrics_df_local.columns:
-            col = metrics_df_local[m].dropna()
-            if len(col) > 0:
-                lines.append(
-                    f"{m} stats: min={col.min():.3f}, median={col.median():.3f}, max={col.max():.3f}"
-                )
-
-    # Highlighted tickers
-    if highlight_tickers_upper:
-        hi = metrics_df_local[metrics_df_local["Ticker_upper"].isin(highlight_tickers_upper)]
-        if not hi.empty:
-            lines.append("")
-            lines.append(f"Highlighted tickers ({len(hi)}):")
-            for _, r in hi.iterrows():
-                def _fmt(v):
-                    try:
-                        return f"{float(v):.3f}"
-                    except Exception:
-                        return "nan"
-
-                lines.append(
-                    f"- {r['Ticker']}: Name={r.get('Name','?')}, Sector={r.get('Sector','?')}, "
-                    f"{x_metric}={_fmt(r.get(x_metric))}, {y_metric}={_fmt(r.get(y_metric))}"
-                )
-
-            # Correlation snapshot for highlighted names (dendrogram-adjacent context)
-            try:
-                tickers_hi = hi["Ticker"].dropna().astype(str).unique().tolist()
-                if len(tickers_hi) >= 2:
-                    pA = prices_local.loc[:asof_ts_local].copy()
-                    cols = [t for t in tickers_hi if t in pA.columns]
-                    pA = pA[cols]
-                    if lookback is not None and lookback > 0 and len(pA) > lookback:
-                        pA = pA.tail(lookback)
-                    rets = pA.pct_change().dropna(how="all")
-                    rets = rets.dropna(axis=1, how="all")
-
-                    if rets.shape[1] >= 2:
-                        corr = rets.corr()
-                        corr_values = []
-                        for i in range(len(corr.columns)):
-                            for j in range(i + 1, len(corr.columns)):
-                                a = corr.columns[i]
-                                b = corr.columns[j]
-                                corr_values.append((a, b, float(corr.loc[a, b])))
-
-                        corr_values_sorted = sorted(corr_values, key=lambda x: x[2], reverse=True)
-                        top = corr_values_sorted[:3]
-                        bottom = corr_values_sorted[-3:]
-
-                        lines.append("")
-                        lines.append("Pairwise correlations between highlighted tickers (daily returns):")
-                        if top:
-                            lines.append("Top positively correlated pairs:")
-                            for a, b, cval in top:
-                                lines.append(f"  - {a} vs {b}: corr={cval:.2f}")
-                        if bottom:
-                            lines.append("Most negatively correlated / weakest pairs:")
-                            for a, b, cval in bottom:
-                                lines.append(f"  - {a} vs {b}: corr={cval:.2f}")
-            except Exception:
-                pass
-
-    return "\n".join(lines)
 
 
 # Gather user metric choices (applies to both A and B)
@@ -671,11 +550,105 @@ else:
     st.caption('Type tickers in the highlight box to see a correlation dendrogram.')
 # -------------------------------------------------------------------------------
 
+# --- Daily Reports (News Feed) --------------------------------------------------
+st.markdown('---')
+st.subheader('🗞️ Daily Reports')
+
+# Reports are published by the mktme_publisher workflow into the mktme-data repo.
+DEFAULT_REPORTS_INDEX = (
+    "https://raw.githubusercontent.com/marshdoggo/mktme-data/main/reports/index.json"
+)
+REPORTS_INDEX_URL = os.environ.get("MKTME_REPORTS_INDEX_URL", DEFAULT_REPORTS_INDEX)
+
+@st.cache_data(ttl=60*60)
+def _load_reports_index(url: str) -> dict:
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+@st.cache_data(ttl=60*60)
+def _load_report_markdown(md_url: str) -> str:
+    r = requests.get(md_url, timeout=30)
+    r.raise_for_status()
+    return r.text
+
+# Try to load the index. If it doesn't exist yet, show a helpful message.
+idx = None
+try:
+    idx = _load_reports_index(REPORTS_INDEX_URL)
+except Exception:
+    idx = None
+
+if idx is None or not isinstance(idx, dict) or "universes" not in idx:
+    st.info(
+        "No published reports found yet. Once your publisher workflow runs, it should create "
+        "`mktme-data/reports/index.json` plus `reports/<universe>/<YYYY-MM-DD>.md`. "
+        "After that, this section will populate automatically."
+    )
+else:
+    uni_map = idx.get("universes", {})
+    entries = uni_map.get(universe, []) if isinstance(uni_map, dict) else []
+
+    # Controls
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        st.caption(f"Source: {REPORTS_INDEX_URL}")
+    with c2:
+        show_n = st.selectbox("Show", [3, 5, 10, 14], index=1, help="How many recent reports to show")
+
+    if not entries:
+        st.info(
+            f"No reports published yet for universe '{universe}'. "
+            "Run the publisher workflow to generate the first report."
+        )
+    else:
+        # base_url can be provided by the publisher; otherwise derive from index URL.
+        base_url = idx.get("base_url")
+        if not base_url:
+            # crude fallback: trim to repo root
+            base_url = "https://raw.githubusercontent.com/marshdoggo/mktme-data/main"
+
+        entries = entries[: int(show_n)]
+
+        # Most recent report preview at top
+        latest = entries[0]
+        latest_date = latest.get("date", "(unknown)")
+        latest_md_rel = latest.get("md")
+
+        if latest_md_rel:
+            latest_md_url = f"{base_url}/{latest_md_rel}"
+            try:
+                latest_md = _load_report_markdown(latest_md_url)
+                with st.expander(f"Latest report — {latest_date}", expanded=True):
+                    st.markdown(latest_md)
+            except Exception as e:
+                st.warning(f"Could not load latest report markdown: {e}")
+        else:
+            st.caption("Latest report entry is missing an 'md' field in reports/index.json.")
+
+        # Older reports
+        if len(entries) > 1:
+            st.markdown("#### Recent archive")
+            for ent in entries[1:]:
+                d = ent.get("date", "(unknown)")
+                rel_md = ent.get("md")
+                if not rel_md:
+                    continue
+                md_url = f"{base_url}/{rel_md}"
+                try:
+                    md = _load_report_markdown(md_url)
+                    with st.expander(f"{d}", expanded=False):
+                        st.markdown(md)
+                except Exception:
+                    with st.expander(f"{d}", expanded=False):
+                        st.caption("Could not load this report.")
+# ------------------------------------------------------------------------------
+
 # --- Chat with the view (OpenAI) ------------------------------------------------
 st.markdown('---')
 st.subheader('💬 Ask the AI about this view')
 
-client = _get_openai_client()
+client = get_openai_client(st)
 
 if client is None:
     st.info(
@@ -693,12 +666,12 @@ else:
     user_q = st.chat_input("Ask a question about the scatter plot, dendrogram, or metrics…")
 
     if user_q:
-        ok, msg = _rate_limit_ok()
+        ok, msg = rate_limit_ok(st.session_state)
         if not ok:
             with st.chat_message("assistant"):
                 st.warning(msg)
         else:
-            ok2, msg2 = _daily_cap_ok()
+            ok2, msg2 = daily_cap_ok(st.session_state)
             if not ok2:
                 with st.chat_message("assistant"):
                     st.warning(msg2)
@@ -708,31 +681,26 @@ else:
                     st.markdown(user_q)
 
                 highlight_upper = list(highlight) if highlight else []
-                context_text = build_view_summary(
-                    metrics_df_A,
-                    prices,
-                    x_metric,
-                    y_metric,
-                    universe,
-                    asof_ts,
-                    lookback,
-                    highlight_upper,
+                context_text = build_view_context_text(
+                    metrics_df=metrics_df_A,
+                    prices=prices,
+                    x_metric=x_metric,
+                    y_metric=y_metric,
+                    universe=universe,
+                    asof_ts=asof_ts,
+                    lookback=lookback,
+                    highlight_upper=highlight_upper,
+                    top_table_rows=5,
+                    include_cluster_summary=True,
                 )
 
-                system_instructions = (
-                    "You are a quantitative markets analyst helping a user interpret a Streamlit dashboard. "
-                    "Use ONLY the provided context. Be numerically concrete and concise."
+                result = ask_ai_about_view(
+                    client=client,
+                    context_text=context_text,
+                    user_question=user_q,
+                    model="gpt-4.1-mini",
                 )
-
-                try:
-                    resp = client.responses.create(
-                        model="gpt-4.1-mini",
-                        instructions=system_instructions,
-                        input=f"CONTEXT:\n{context_text}\n\nUSER_QUESTION:\n{user_q}",
-                    )
-                    answer = resp.output_text
-                except Exception as e:
-                    answer = f"Error calling OpenAI API: {e}"
+                answer = result.answer
 
                 with st.chat_message("assistant"):
                     st.markdown(answer)
