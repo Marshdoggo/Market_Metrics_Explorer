@@ -122,6 +122,7 @@ def build_facts_block(report: Dict[str, Any]) -> Dict[str, Any]:
     facts: Dict[str, Any] = {
         "schema_version": report.get("schema_version", 1),
         "universe": report.get("universe"),
+        "universe_size": report.get("universe_size"),
         "asof_date": report.get("asof_date"),
         "lookback_trading_days": report.get("lookback_trading_days"),
         "primary_rank_metric": report.get("primary_rank_metric"),
@@ -204,19 +205,79 @@ def allowed_numbers_from_facts(facts: Dict[str, Any]) -> set[str]:
 
 
 def validate_commentary_numbers(commentary: str, facts: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Return (ok, unexpected_numbers). Only checks numeric literals."""
+    """Return (ok, unexpected_numbers). Only checks numeric literals.
+
+    Notes:
+      - We ignore obvious date fragments (YYYY-MM-DD or YYYY/MM/DD) and small list/bullet indices.
+      - Everything else numeric must be present (in some acceptable rendering) in the facts whitelist.
+    """
     allowed = allowed_numbers_from_facts(facts)
-    nums = _extract_numbers(commentary)
+
+    # Remove date-like substrings to prevent rejecting 2025-12-26 fragments.
+    scrubbed = re.sub(r"\b\d{4}[-/]\d{2}[-/]\d{2}\b", " ", commentary)
+
+    nums = _extract_numbers(scrubbed)
 
     unexpected: List[str] = []
     for n in nums:
-        # ignore bullet indices like 1,2,3 and years in dates (2025-12-26)
-        if n.isdigit() and (len(n) <= 2 or len(n) == 4):
+        # ignore bullet indices and small ordinals like 1,2,3
+        if n.isdigit() and len(n) <= 2:
+            continue
+        # ignore 4-digit years that might appear outside dates
+        if n.isdigit() and len(n) == 4:
             continue
         if n not in allowed:
             unexpected.append(n)
 
     return (len(unexpected) == 0), unexpected
+
+
+def sanitize_llm_commentary(commentary: str) -> str:
+    """Light cleanup for LLM commentary. Keeps it human-readable but avoids weird whitespace."""
+    if commentary is None:
+        return ""
+    # Normalize newlines and strip leading/trailing whitespace
+    text = str(commentary).replace("\r\n", "\n").replace("\r", "\n").strip()
+    # Collapse excessive blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+def attach_llm_commentary_to_markdown(markdown: str, commentary: str, facts: Dict[str, Any]) -> Tuple[str, bool, List[str]]:
+    """Attach LLM commentary to the deterministic markdown.
+
+    Returns:
+      (new_markdown, accepted, unexpected_numbers)
+
+    If numeric validation fails, the original markdown is returned unchanged.
+    """
+    cleaned = sanitize_llm_commentary(commentary)
+    if not cleaned:
+        return markdown, True, []
+
+    ok, unexpected = validate_commentary_numbers(cleaned, facts)
+    if not ok:
+        return markdown, False, unexpected
+
+    # Add commentary as its own section near the top (after Headlines).
+    marker = "## Headlines\n"
+    if marker in markdown:
+        parts = markdown.split(marker, 1)
+        head, rest = parts[0], parts[1]
+        injected = (
+            marker
+            + rest.split("\n\n", 1)[0]
+            + "\n\n"
+            + "## Commentary (LLM)\n\n"
+            + cleaned
+            + "\n\n"
+            + (rest.split("\n\n", 1)[1] if "\n\n" in rest else "")
+        )
+        return head + injected, True, []
+
+    # Fallback: append at end
+    new_md = markdown.rstrip() + "\n\n## Commentary (LLM)\n\n" + cleaned + "\n"
+    return new_md, True, []
 
 
 @dataclass
@@ -248,6 +309,12 @@ def generate_daily_report(
             df = df.reset_index().rename(columns={df.index.name: "Ticker"})
         else:
             df = df.reset_index().rename(columns={"index": "Ticker"})
+
+    # Universe size (deterministic) — used to whitelist counts in LLM commentary
+    try:
+        universe_size = int(df["Ticker"].nunique())
+    except Exception:
+        universe_size = None
 
     base_cols = _pick_cols(df, ["Ticker", "Name", "Sector", "SubIndustry"])
     metric_cols = _pick_cols(df, [
@@ -301,6 +368,7 @@ def generate_daily_report(
     report = {
         "schema_version": 1,
         "universe": universe,
+        "universe_size": universe_size,
         "asof_date": asof_date,
         "lookback_trading_days": int(lookback),
         "primary_rank_metric": primary_rank_metric,
@@ -335,6 +403,7 @@ def generate_daily_report(
 
 def _render_markdown(report: Dict[str, Any]) -> str:
     u = report.get("universe", "?")
+    usz = report.get("universe_size")
     d = report.get("asof_date", "?")
     lb = report.get("lookback_trading_days", "?")
     prim = report.get("primary_rank_metric", "Annualized Sharpe")
@@ -358,7 +427,13 @@ def _render_markdown(report: Dict[str, Any]) -> str:
 
     blocks = []
     blocks.append(f"# Market Metric Explorer — Daily Brief\n")
-    blocks.append(f"- Universe: **{u}**\n- As-of: **{d}**\n- Lookback: **{lb} trading days**\n- Primary rank metric: **{prim}**\n")
+    uni_line = f"- Universe: **{u}**" + (f" ({usz} tickers)" if usz is not None else "")
+    blocks.append(
+        uni_line
+        + f"\n- As-of: **{d}**"
+        + f"\n- Lookback: **{lb} trading days**"
+        + f"\n- Primary rank metric: **{prim}**\n"
+    )
 
     dist = report.get("distribution", {}) or {}
     ext = report.get("extremes", {}) or {}

@@ -211,3 +211,5 @@ __marimo__/
 !data/cache_universes/*.csv
 
 .streamlit/secrets.toml 
+
+src/.streamlit/secrets.toml
