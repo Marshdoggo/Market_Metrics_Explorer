@@ -14,7 +14,6 @@ from pathlib import Path
 
 import pandas as pd
 
-
 def _fmt(v: Any, digits: int = 4) -> Optional[float]:
     try:
         if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -69,9 +68,161 @@ def _sector_summary(df: pd.DataFrame, metric: str, n: int = 5) -> Dict[str, Any]
     }
 
 
+import re
+
+
+def _safe_num(v: Any) -> Optional[float]:
+    """Coerce to float or return None."""
+    try:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _dist_stats(df: pd.DataFrame, col: str) -> Dict[str, Any]:
+    """Return min/median/max for a numeric column, plus count."""
+    if col not in df.columns:
+        return {"available": False, "column": col}
+    x = pd.to_numeric(df[col], errors="coerce").dropna()
+    if x.empty:
+        return {"available": False, "column": col}
+    return {
+        "available": True,
+        "column": col,
+        "count": int(x.shape[0]),
+        "min": _fmt(x.min(), 4),
+        "median": _fmt(x.median(), 4),
+        "max": _fmt(x.max(), 4),
+    }
+
+
+def _extreme_row(df: pd.DataFrame, col: str, highest: bool) -> Dict[str, Any]:
+    """Return {Ticker, Name, value} for the extreme of `col`."""
+    if col not in df.columns:
+        return {"available": False, "column": col}
+    x = df.copy()
+    x[col] = pd.to_numeric(x[col], errors="coerce")
+    x = x.dropna(subset=[col])
+    if x.empty:
+        return {"available": False, "column": col}
+    r = x.sort_values(col, ascending=not highest).iloc[0]
+    return {
+        "available": True,
+        "column": col,
+        "Ticker": str(r.get("Ticker")) if r.get("Ticker") is not None else None,
+        "Name": None if (isinstance(r.get("Name"), float) and pd.isna(r.get("Name"))) else (str(r.get("Name")) if r.get("Name") is not None else None),
+        "value": _fmt(r.get(col), 4),
+    }
+
+
+def build_facts_block(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract a compact, JSON-friendly facts block from the full report."""
+    facts: Dict[str, Any] = {
+        "schema_version": report.get("schema_version", 1),
+        "universe": report.get("universe"),
+        "asof_date": report.get("asof_date"),
+        "lookback_trading_days": report.get("lookback_trading_days"),
+        "primary_rank_metric": report.get("primary_rank_metric"),
+        "distribution": report.get("distribution", {}),
+        "extremes": report.get("extremes", {}),
+        "leaders": {},
+    }
+
+    lbs = report.get("leaderboards", {}) or {}
+    # Prefer the already-sorted leaderboards from the deterministic pipeline
+    facts["leaders"]["top_by_primary_metric"] = (lbs.get("top_by_primary_metric") or [])[:5]
+    facts["leaders"]["top_by_sortino"] = (lbs.get("top_by_sortino") or [])[:5]
+    facts["leaders"]["top_by_cagr"] = (lbs.get("top_by_cagr") or [])[:5]
+    facts["leaders"]["worst_by_max_drawdown"] = (lbs.get("worst_by_max_drawdown") or [])[:5]
+    facts["leaders"]["top_by_volatility"] = (lbs.get("top_by_volatility") or [])[:5]
+
+    # Sector summary (already deterministic)
+    facts["sector_summary"] = report.get("sector_summary", {})
+    return facts
+
+
+def facts_json_text(facts: Dict[str, Any]) -> str:
+    """Compact JSON string suitable for LLM prompts."""
+    return json.dumps(facts, ensure_ascii=False, separators=(",", ":"))
+
+
+def _extract_numbers(text: str) -> List[str]:
+    """Extract numeric literals that look like metrics (floats/percents/negatives)."""
+    # capture things like -0.30, 1.9919, 17.48, 38.3%, -91.9%
+    pat = r"(?<![A-Za-z0-9_])[-+]?\d+(?:\.\d+)?%?"
+    return re.findall(pat, text)
+
+
+def allowed_numbers_from_facts(facts: Dict[str, Any]) -> set[str]:
+    """Build a whitelist of numeric strings that are allowed to appear in LLM commentary."""
+    allowed: set[str] = set()
+
+    def _walk(v: Any):
+        if v is None:
+            return
+        if isinstance(v, (int, float)):
+            # Include several common renderings to avoid false rejects
+            f = float(v)
+            allowed.add(str(int(f)) if f.is_integer() else str(f))
+            allowed.add(f"{f:.4f}")
+            allowed.add(f"{f:.3f}")
+            allowed.add(f"{f:.2f}")
+            allowed.add(f"{f:.1f}")
+            return
+        if isinstance(v, str):
+            # If the string is numeric-ish, keep it
+            for n in _extract_numbers(v):
+                allowed.add(n)
+            return
+        if isinstance(v, dict):
+            for vv in v.values():
+                _walk(vv)
+            return
+        if isinstance(v, list):
+            for vv in v:
+                _walk(vv)
+            return
+
+    _walk(facts)
+
+    # Allow common percent forms for drawdowns etc.
+    extra = set()
+    for n in list(allowed):
+        if n.endswith("%"):
+            continue
+        try:
+            f = float(n)
+            extra.add(f"{f*100:.1f}%")
+            extra.add(f"{f*100:.0f}%")
+        except Exception:
+            pass
+    allowed |= extra
+
+    return allowed
+
+
+def validate_commentary_numbers(commentary: str, facts: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Return (ok, unexpected_numbers). Only checks numeric literals."""
+    allowed = allowed_numbers_from_facts(facts)
+    nums = _extract_numbers(commentary)
+
+    unexpected: List[str] = []
+    for n in nums:
+        # ignore bullet indices like 1,2,3 and years in dates (2025-12-26)
+        if n.isdigit() and (len(n) <= 2 or len(n) == 4):
+            continue
+        if n not in allowed:
+            unexpected.append(n)
+
+    return (len(unexpected) == 0), unexpected
+
+
 @dataclass
 class DailyReport:
     report: Dict[str, Any]
+    facts: Dict[str, Any]
     markdown: str
 
 
@@ -108,6 +259,16 @@ def generate_daily_report(
         "Max Drawdown",
         "RSI(14)",
     ])
+
+    # Distribution summaries (deterministic facts)
+    dist_primary = _dist_stats(df, primary_rank_metric)
+    dist_vol = _dist_stats(df, "Daily Volatility (Std)")
+    dist_rsi = _dist_stats(df, "RSI(14)")
+
+    # Extremes (deterministic facts)
+    worst_dd_row = _extreme_row(df, "Max Drawdown", highest=False)
+    top_rsi_row = _extreme_row(df, "RSI(14)", highest=True)
+    low_rsi_row = _extreme_row(df, "RSI(14)", highest=False)
 
     # Leaderboards
     top_primary = _top_n(df, by=primary_rank_metric, n=top_n, ascending=False)
@@ -150,6 +311,16 @@ def generate_daily_report(
             "worst_by_max_drawdown": _rows(worst_dd),
             "top_by_volatility": _rows(top_vol),
         },
+        "distribution": {
+            "primary_metric": dist_primary,
+            "daily_volatility": dist_vol,
+            "rsi14": dist_rsi,
+        },
+        "extremes": {
+            "largest_drawdown": worst_dd_row,
+            "rsi_high": top_rsi_row,
+            "rsi_low": low_rsi_row,
+        },
         "sector_summary": sector_block,
         "notes": [
             f"Tables are computed from the app's cached price dataset and metrics pipeline.",
@@ -158,7 +329,8 @@ def generate_daily_report(
     }
 
     md = _render_markdown(report)
-    return DailyReport(report=report, markdown=md)
+    facts = build_facts_block(report)
+    return DailyReport(report=report, facts=facts, markdown=md)
 
 
 def _render_markdown(report: Dict[str, Any]) -> str:
@@ -187,6 +359,30 @@ def _render_markdown(report: Dict[str, Any]) -> str:
     blocks = []
     blocks.append(f"# Market Metric Explorer — Daily Brief\n")
     blocks.append(f"- Universe: **{u}**\n- As-of: **{d}**\n- Lookback: **{lb} trading days**\n- Primary rank metric: **{prim}**\n")
+
+    dist = report.get("distribution", {}) or {}
+    ext = report.get("extremes", {}) or {}
+
+    blocks.append("## Headlines\n")
+
+    prim_stats = dist.get("primary_metric", {})
+    if prim_stats.get("available"):
+        blocks.append(f"- {prim} distribution: min **{prim_stats.get('min')}**, median **{prim_stats.get('median')}**, max **{prim_stats.get('max')}**.")
+
+    vol_stats = dist.get("daily_volatility", {})
+    if vol_stats.get("available"):
+        blocks.append(f"- Daily volatility distribution: min **{vol_stats.get('min')}**, median **{vol_stats.get('median')}**, max **{vol_stats.get('max')}**.")
+
+    ldd = ext.get("largest_drawdown", {})
+    if ldd.get("available"):
+        blocks.append(f"- Largest drawdown name: **{ldd.get('Ticker')}** with max drawdown **{ldd.get('value')}**.")
+
+    rhi = ext.get("rsi_high", {})
+    rlo = ext.get("rsi_low", {})
+    if rhi.get("available") and rlo.get("available"):
+        blocks.append(f"- RSI extremes (14): highest **{rhi.get('Ticker')}** ({rhi.get('value')}), lowest **{rlo.get('Ticker')}** ({rlo.get('value')}).")
+
+    blocks.append("")
 
     lbs = report.get("leaderboards", {})
     blocks.append(_md_table(lbs.get("top_by_primary_metric", []), f"Top by {prim}"))

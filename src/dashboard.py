@@ -1,5 +1,5 @@
+
 import os
-os.system("pip install yfinance beautifulsoup4 html5lib requests pyarrow --quiet")
 
 import sys
 sys.path.append(os.path.dirname(__file__))  # ensure src/ is on sys.path
@@ -102,6 +102,10 @@ st.title('📈 Market Metric Explorer')
 
 with st.sidebar:
     st.header('Settings')
+    if st.button("🔄 Refresh cached data", help="Clears Streamlit cached downloads (manifest, parquet, reports). Useful when a new publisher run landed but the app is still showing older data."):
+        st.cache_data.clear()
+        st.toast("Cache cleared — rerunning…")
+        st.rerun()
     universe = st.selectbox(
         'Universe',
         ['sp500', 'nasdaq100', 'dow30', 'fx'],
@@ -560,22 +564,24 @@ DEFAULT_REPORTS_INDEX = (
 )
 REPORTS_INDEX_URL = os.environ.get("MKTME_REPORTS_INDEX_URL", DEFAULT_REPORTS_INDEX)
 
-@st.cache_data(ttl=60*60)
-def _load_reports_index(url: str) -> dict:
+@st.cache_data(ttl=5*60)
+def _load_reports_index(url: str, cache_key: str) -> dict:
     r = requests.get(url, timeout=30)
     r.raise_for_status()
     return r.json()
 
-@st.cache_data(ttl=60*60)
-def _load_report_markdown(md_url: str) -> str:
+@st.cache_data(ttl=5*60)
+def _load_report_markdown(md_url: str, cache_key: str) -> str:
     r = requests.get(md_url, timeout=30)
     r.raise_for_status()
     return r.text
 
 # Try to load the index. If it doesn't exist yet, show a helpful message.
 idx = None
+# Cache-buster: when the underlying dataset max date advances, refresh report/index fetches.
+reports_cache_key = str(max_day) if 'max_day' in locals() else str(pd.Timestamp.utcnow().date())
 try:
-    idx = _load_reports_index(REPORTS_INDEX_URL)
+    idx = _load_reports_index(REPORTS_INDEX_URL, cache_key=reports_cache_key)
 except Exception:
     idx = None
 
@@ -618,7 +624,7 @@ else:
         if latest_md_rel:
             latest_md_url = f"{base_url}/{latest_md_rel}"
             try:
-                latest_md = _load_report_markdown(latest_md_url)
+                latest_md = _load_report_markdown(latest_md_url, cache_key=reports_cache_key)
                 with st.expander(f"Latest report — {latest_date}", expanded=True):
                     st.markdown(latest_md)
             except Exception as e:
@@ -636,7 +642,7 @@ else:
                     continue
                 md_url = f"{base_url}/{rel_md}"
                 try:
-                    md = _load_report_markdown(md_url)
+                    md = _load_report_markdown(md_url, cache_key=reports_cache_key)
                     with st.expander(f"{d}", expanded=False):
                         st.markdown(md)
                 except Exception:
