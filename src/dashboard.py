@@ -576,6 +576,12 @@ def _load_report_markdown(md_url: str, cache_key: str) -> str:
     r.raise_for_status()
     return r.text
 
+@st.cache_data(ttl=5*60)
+def _load_report_json(json_url: str, cache_key: str) -> dict:
+    r = requests.get(json_url, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
 # Try to load the index. If it doesn't exist yet, show a helpful message.
 idx = None
 # Cache-buster: when the underlying dataset max date advances, refresh report/index fetches.
@@ -596,11 +602,17 @@ else:
     entries = uni_map.get(universe, []) if isinstance(uni_map, dict) else []
 
     # Controls
-    c1, c2 = st.columns([2, 1])
+    c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
         st.caption(f"Source: {REPORTS_INDEX_URL}")
     with c2:
         show_n = st.selectbox("Show", [3, 5, 10, 14], index=1, help="How many recent reports to show")
+    with c3:
+        debug_reports = st.checkbox(
+            "Debug",
+            value=False,
+            help="Compare the publisher's facts.json to the metrics in the current UI table when dates match."
+        )
 
     if not entries:
         st.info(
@@ -623,10 +635,156 @@ else:
 
         if latest_md_rel:
             latest_md_url = f"{base_url}/{latest_md_rel}"
+            # Derive a facts.json URL next to the markdown (publisher writes <date>.facts.json)
+            latest_facts_url = None
+            if isinstance(latest_md_rel, str) and latest_md_rel.endswith(".md"):
+                latest_facts_url = f"{base_url}/{latest_md_rel[:-3]}.facts.json"
+
             try:
                 latest_md = _load_report_markdown(latest_md_url, cache_key=reports_cache_key)
                 with st.expander(f"Latest report — {latest_date}", expanded=True):
                     st.markdown(latest_md)
+
+                    # Optional debug: compare publisher facts to current UI metrics
+                    if 'debug_reports' in locals() and debug_reports and latest_facts_url:
+                        st.markdown('---')
+                        st.caption('Debug: comparing publisher facts to current UI table (only meaningful when dates/params match).')
+
+                        facts = None
+                        try:
+                            facts = _load_report_json(latest_facts_url, cache_key=reports_cache_key)
+                        except Exception as e:
+                            st.warning(f"Could not load report facts.json: {e}")
+
+                        if isinstance(facts, dict):
+                            # Try to read metadata from facts.json (schema-flexible)
+                            facts_asof = facts.get('asof') or facts.get('as_of') or facts.get('asof_date') or facts.get('date')
+                            facts_lb = facts.get('lookback') or facts.get('lookback_days') or facts.get('lookback_trading_days')
+                            facts_uni = facts.get('universe')
+
+                            meta_cols = st.columns(3)
+                            with meta_cols[0]:
+                                st.caption(f"facts.universe: {facts_uni}")
+                            with meta_cols[1]:
+                                st.caption(f"facts.asof: {facts_asof}")
+                            with meta_cols[2]:
+                                st.caption(f"facts.lookback: {facts_lb}")
+
+                            # Determine whether we're comparing like-for-like
+                            ui_asof = str(asof_ts.date()) if 'asof_ts' in locals() else None
+                            comparable = True
+                            if facts_uni and str(facts_uni) != str(universe):
+                                comparable = False
+                            if facts_asof and ui_asof and str(facts_asof)[:10] != ui_asof:
+                                comparable = False
+                            if facts_lb is not None and 'lookback' in locals():
+                                try:
+                                    if int(facts_lb) != int(lookback):
+                                        comparable = False
+                                except Exception:
+                                    pass
+
+                            if not comparable:
+                                st.info(
+                                    "This facts.json does not match the current UI parameters (universe/asof/lookback). "
+                                    "Switch your UI As-of date to the report date (and same lookback) to compare cleanly."
+                                )
+                            else:
+                                # Extract leader rows from facts in a schema-tolerant way
+                                leaders = (
+                                    facts.get('leaders')
+                                    or facts.get('top')
+                                    or facts.get('top_by_sharpe')
+                                    or (facts.get('sections', {}) or {}).get('leaders')
+                                )
+
+                                leader_rows = []
+                                if isinstance(leaders, list):
+                                    leader_rows = leaders
+                                elif isinstance(leaders, dict):
+                                    # if dict, prefer a common key
+                                    for k in ['top_by_sharpe', 'sharpe', 'annualized_sharpe', 'items']:
+                                        v = leaders.get(k)
+                                        if isinstance(v, list):
+                                            leader_rows = v
+                                            break
+
+                                # Build a comparison table using current UI metrics_df_A
+                                if leader_rows and 'metrics_df_A' in locals():
+                                    ui_df = metrics_df_A.copy()
+                                    ui_df['Ticker_upper'] = ui_df['Ticker'].astype(str).str.upper()
+
+                                    # Helper to pull a numeric value from a leader row for a given set of candidate keys
+                                    def _pick_num(row: dict, keys):
+                                        for kk in keys:
+                                            if kk in row:
+                                                try:
+                                                    return float(row[kk])
+                                                except Exception:
+                                                    return None
+                                        return None
+
+                                    for r in leader_rows[:10]:
+                                        if not isinstance(r, dict):
+                                            continue
+                                        t = (r.get('ticker') or r.get('Ticker') or r.get('symbol') or '').strip()
+                                        if not t:
+                                            continue
+                                        tu = t.upper()
+                                        ui_match = ui_df[ui_df['Ticker_upper'] == tu]
+                                        if ui_match.empty:
+                                            continue
+                                        ui_row = ui_match.iloc[0]
+
+                                        fact_sharpe = _pick_num(r, ['sharpe', 'annualized_sharpe', 'Annualized Sharpe', 'ann_sharpe'])
+                                        ui_sharpe = None
+                                        if 'Annualized Sharpe' in ui_row.index:
+                                            try:
+                                                ui_sharpe = float(ui_row['Annualized Sharpe'])
+                                            except Exception:
+                                                ui_sharpe = None
+
+                                        fact_vol = _pick_num(r, ['daily_vol', 'daily_volatility', 'Daily Volatility (Std)', 'vol'])
+                                        ui_vol = None
+                                        if 'Daily Volatility (Std)' in ui_row.index:
+                                            try:
+                                                ui_vol = float(ui_row['Daily Volatility (Std)'])
+                                            except Exception:
+                                                ui_vol = None
+
+                                        fact_dd = _pick_num(r, ['max_drawdown', 'Max Drawdown', 'dd'])
+                                        ui_dd = None
+                                        if 'Max Drawdown' in ui_row.index:
+                                            try:
+                                                ui_dd = float(ui_row['Max Drawdown'])
+                                            except Exception:
+                                                ui_dd = None
+
+                                        leader_rows_name = r.get('name') or r.get('Name') or ui_row.get('Name', '')
+
+                                        leader_rows_out = {
+                                            'Ticker': tu,
+                                            'Name': leader_rows_name,
+                                            'Sharpe (facts)': fact_sharpe,
+                                            'Sharpe (UI)': ui_sharpe,
+                                            'Δ Sharpe': (None if (fact_sharpe is None or ui_sharpe is None) else (fact_sharpe - ui_sharpe)),
+                                            'Vol (facts)': fact_vol,
+                                            'Vol (UI)': ui_vol,
+                                            'Δ Vol': (None if (fact_vol is None or ui_vol is None) else (fact_vol - ui_vol)),
+                                            'MaxDD (facts)': fact_dd,
+                                            'MaxDD (UI)': ui_dd,
+                                            'Δ MaxDD': (None if (fact_dd is None or ui_dd is None) else (fact_dd - ui_dd)),
+                                        }
+                                        leader_rows.append(leader_rows_out)
+
+                                    if leader_rows:
+                                        cmp = pd.DataFrame(leader_rows)
+                                        st.dataframe(cmp)
+                                    else:
+                                        st.caption('No comparable leader rows found in facts.json (schema mismatch) or tickers not present in UI frame.')
+                                else:
+                                    st.caption('facts.json did not expose a recognizable leaders list to compare.')
+
             except Exception as e:
                 st.warning(f"Could not load latest report markdown: {e}")
         else:

@@ -14,13 +14,26 @@ from pathlib import Path
 
 import pandas as pd
 
-def _fmt(v: Any, digits: int = 4) -> Optional[float]:
+
+    
+def _fmt(v: Any, digits: int = 4, as_str: bool = False) -> Optional[Any]:
+    """
+    Format numeric values deterministically.
+
+    - Returns None for None/NaN.
+    - If as_str=False: returns a rounded float.
+    - If as_str=True: returns a fixed-decimal string with `digits` places.
+    """
     try:
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return None
-        return round(float(v), digits)
+        f = float(v)
+        if as_str:
+            return f"{f:.{digits}f}"
+        return round(f, digits)
     except Exception:
-        return None
+        return None    
+
 
 
 def _pick_cols(df: pd.DataFrame, cols: List[str]) -> List[str]:
@@ -92,9 +105,9 @@ def _dist_stats(df: pd.DataFrame, col: str) -> Dict[str, Any]:
         "available": True,
         "column": col,
         "count": int(x.shape[0]),
-        "min": _fmt(x.min(), 4),
-        "median": _fmt(x.median(), 4),
-        "max": _fmt(x.max(), 4),
+        "min": _fmt(x.min(), 4, as_str=True),
+        "median": _fmt(x.median(), 4, as_str=True),
+        "max": _fmt(x.max(), 4, as_str=True),
     }
 
 
@@ -113,7 +126,7 @@ def _extreme_row(df: pd.DataFrame, col: str, highest: bool) -> Dict[str, Any]:
         "column": col,
         "Ticker": str(r.get("Ticker")) if r.get("Ticker") is not None else None,
         "Name": None if (isinstance(r.get("Name"), float) and pd.isna(r.get("Name"))) else (str(r.get("Name")) if r.get("Name") is not None else None),
-        "value": _fmt(r.get(col), 4),
+        "value": _fmt(r.get(col), 4, as_str=True),
     }
 
 
@@ -148,6 +161,27 @@ def facts_json_text(facts: Dict[str, Any]) -> str:
     """Compact JSON string suitable for LLM prompts."""
     return json.dumps(facts, ensure_ascii=False, separators=(",", ":"))
 
+def llm_facts_payload(daily: 'DailyReport') -> Dict[str, Any]:
+    """
+    Minimal payload intended for LLM prompting.
+
+    IMPORTANT:
+      - This intentionally excludes the full report and excludes any raw dataframe.
+      - Upstream callers should pass ONLY `facts_json_text(llm_facts_payload(...))`
+        to the model when generating commentary.
+    """
+    return {
+        "schema_version": daily.facts.get("schema_version", 1),
+        "universe": daily.facts.get("universe"),
+        "universe_size": daily.facts.get("universe_size"),
+        "asof_date": daily.facts.get("asof_date"),
+        "lookback_trading_days": daily.facts.get("lookback_trading_days"),
+        "primary_rank_metric": daily.facts.get("primary_rank_metric"),
+        "distribution": daily.facts.get("distribution", {}),
+        "extremes": daily.facts.get("extremes", {}),
+        "leaders": daily.facts.get("leaders", {}),
+        "sector_summary": daily.facts.get("sector_summary", {}),
+    }
 
 def _extract_numbers(text: str) -> List[str]:
     """Extract numeric literals that look like metrics (floats/percents/negatives)."""
@@ -156,26 +190,48 @@ def _extract_numbers(text: str) -> List[str]:
     return re.findall(pat, text)
 
 
+
 def allowed_numbers_from_facts(facts: Dict[str, Any]) -> set[str]:
-    """Build a whitelist of numeric strings that are allowed to appear in LLM commentary."""
+    """
+    Build a whitelist of numeric strings allowed to appear in LLM commentary.
+
+    Design goals:
+      - Facts store numbers primarily as fixed-decimal strings to match markdown tables.
+      - The whitelist also includes trimmed variants (dropping trailing zeros and trailing dots).
+      - Includes a few common decimal renderings for floats and percent renderings.
+    """
     allowed: set[str] = set()
+
+    def _add_numeric_str(s: str) -> None:
+        s = s.strip()
+        if not s:
+            return
+        allowed.add(s)
+
+        # Add trimmed variants: "1.9900" -> "1.99" -> "1"
+        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?%?", s):
+            if s.endswith("%"):
+                core = s[:-1]
+                core_trim = core.rstrip("0").rstrip(".")
+                if core_trim:
+                    allowed.add(core_trim + "%")
+            else:
+                core_trim = s.rstrip("0").rstrip(".")
+                if core_trim:
+                    allowed.add(core_trim)
 
     def _walk(v: Any):
         if v is None:
             return
         if isinstance(v, (int, float)):
-            # Include several common renderings to avoid false rejects
             f = float(v)
-            allowed.add(str(int(f)) if f.is_integer() else str(f))
-            allowed.add(f"{f:.4f}")
-            allowed.add(f"{f:.3f}")
-            allowed.add(f"{f:.2f}")
-            allowed.add(f"{f:.1f}")
+            _add_numeric_str(str(int(f)) if f.is_integer() else str(f))
+            for d in (4, 3, 2, 1):
+                _add_numeric_str(f"{f:.{d}f}")
             return
         if isinstance(v, str):
-            # If the string is numeric-ish, keep it
             for n in _extract_numbers(v):
-                allowed.add(n)
+                _add_numeric_str(n)
             return
         if isinstance(v, dict):
             for vv in v.values():
@@ -189,7 +245,7 @@ def allowed_numbers_from_facts(facts: Dict[str, Any]) -> set[str]:
     _walk(facts)
 
     # Allow common percent forms for drawdowns etc.
-    extra = set()
+    extra: set[str] = set()
     for n in list(allowed):
         if n.endswith("%"):
             continue
@@ -199,10 +255,10 @@ def allowed_numbers_from_facts(facts: Dict[str, Any]) -> set[str]:
             extra.add(f"{f*100:.0f}%")
         except Exception:
             pass
-    allowed |= extra
+    for e in extra:
+        _add_numeric_str(e)
 
     return allowed
-
 
 def validate_commentary_numbers(commentary: str, facts: Dict[str, Any]) -> Tuple[bool, List[str]]:
     """Return (ok, unexpected_numbers). Only checks numeric literals.
@@ -356,7 +412,7 @@ def generate_daily_report(
             row: Dict[str, Any] = {}
             for c in keep:
                 if c in metric_cols:
-                    row[c] = _fmt(r.get(c), 6 if c in ("Mean Daily Return",) else 4)
+                    row[c] = _fmt(r.get(c), 6 if c in ("Mean Daily Return",) else 4, as_str=True)
                 else:
                     val = r.get(c)
                     row[c] = None if (isinstance(val, float) and pd.isna(val)) else str(val)

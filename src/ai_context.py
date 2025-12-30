@@ -9,8 +9,9 @@ ai_context.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import os
+import re
 from time import time
 
 import pandas as pd
@@ -112,6 +113,7 @@ def _table_top_n(
     y_metric: str,
     top_n: int = 5,
     highlight_upper: Optional[List[str]] = None,
+    strict_columns: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
     Mimic your UI table ordering: sort by y_metric desc,
@@ -129,10 +131,25 @@ def _table_top_n(
     else:
         df = df.sort_values(by=y_metric, ascending=False, na_position="last")
 
-    cols = []
-    for c in ["Ticker", "Name", "Sector", "SubIndustry", x_metric, y_metric, "Annualized Sharpe", "Sortino Ratio", "Max Drawdown", "CAGR", "Daily Volatility (Std)"]:
-        if c in df.columns and c not in cols:
-            cols.append(c)
+    cols: List[str] = []
+
+    # If strict_columns is provided, only emit those (in that order) if present
+    if strict_columns:
+        for c in strict_columns:
+            if c in df.columns and c not in cols:
+                cols.append(c)
+    else:
+        # Default behavior: include identifiers + selected axes + a few common risk/return columns.
+        base = ["Ticker", "Name", "Sector", "SubIndustry"]
+        for c in base:
+            if c in df.columns and c not in cols:
+                cols.append(c)
+
+        # Avoid duplicating metrics if x/y already refer to the same canonical column names.
+        metric_candidates = [x_metric, y_metric, "Annualized Sharpe", "Sortino Ratio", "Max Drawdown", "CAGR", "Daily Volatility (Std)"]
+        for c in metric_candidates:
+            if c in df.columns and c not in cols:
+                cols.append(c)
 
     if not cols:
         return df.head(top_n)
@@ -245,6 +262,47 @@ def _summarize_clusters(
     return lines
 
 
+# ----------------------------- Guardrails -------------------------------------
+
+_NUM_RE = re.compile(r"(?<![A-Za-z])[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+
+def _extract_numbers(text: str) -> List[str]:
+    """
+    Extract number-like tokens from text (integers, decimals, scientific notation).
+    Returns the raw string tokens so we can compare exact appearances.
+    """
+    if not text:
+        return []
+    return _NUM_RE.findall(text)
+
+def validate_answer_numbers(
+    context_text: str,
+    answer_text: str,
+    allow_extra: Optional[List[str]] = None,
+) -> Tuple[bool, List[str]]:
+    """
+    Returns (ok, unexpected_numbers).
+
+    'ok' is True iff every numeric token in answer_text also appears somewhere in context_text,
+    except tokens in allow_extra.
+
+    This is intentionally strict: it blocks “helpful” made-up numbers.
+    """
+    allow = set([str(x) for x in (allow_extra or [])])
+
+    ctx_nums = set(_extract_numbers(context_text))
+    ans_nums = _extract_numbers(answer_text)
+
+    unexpected: List[str] = []
+    for n in ans_nums:
+        if n in allow:
+            continue
+        if n not in ctx_nums:
+            unexpected.append(n)
+
+    return (len(unexpected) == 0), unexpected
+
+
 def build_view_context_text(
     metrics_df: pd.DataFrame,
     prices: pd.DataFrame,
@@ -256,6 +314,8 @@ def build_view_context_text(
     highlight_upper: Optional[List[str]] = None,
     top_table_rows: int = 5,
     include_cluster_summary: bool = True,
+    strict_table_only: bool = False,
+    table_columns: Optional[List[str]] = None,
 ) -> str:
     """
     Build a compact context string for the LLM.
@@ -266,6 +326,8 @@ def build_view_context_text(
     - highlighted tickers snapshot (x/y + sector/name if available)
     - top-N rows of the data table as shown (sorted by y desc + highlight pinned)
     - correlation + cluster summary for highlighted tickers (dendrogram-adjacent)
+    - If strict_table_only=True, context will include ONLY the table slice + minimal metadata,
+      and will exclude correlation/cluster summaries to prevent introducing extra numbers.
     """
     lines: List[str] = []
 
@@ -287,7 +349,14 @@ def build_view_context_text(
 
     # Top-N table rows (as user sees it)
     try:
-        tbl = _table_top_n(metrics_df, x_metric, y_metric, top_n=top_table_rows, highlight_upper=highlight_upper or [])
+        tbl = _table_top_n(
+            metrics_df,
+            x_metric,
+            y_metric,
+            top_n=top_table_rows,
+            highlight_upper=highlight_upper or [],
+            strict_columns=table_columns if strict_table_only else None,
+        )
         if not tbl.empty:
             lines.append("")
             lines.append(f"Top {min(top_table_rows, len(tbl))} rows from the Data Table (ordered like the UI):")
@@ -303,11 +372,15 @@ def build_view_context_text(
                     else:
                         row.append(str(v) if v is not None and not (isinstance(v, float) and pd.isna(v)) else "")
                 lines.append("ROW: " + " | ".join(row))
+
+            # In strict mode, stop here: we do not want any other numeric sources.
+            if strict_table_only:
+                return "\n".join(lines)
     except Exception:
         pass
 
-    # Highlighted tickers details
-    if highlight_upper:
+    # Highlighted tickers details (disabled in strict_table_only mode to avoid extra numbers)
+    if highlight_upper and not strict_table_only:
         hu = [t.upper() for t in highlight_upper]
         df2 = metrics_df.copy()
         if "Ticker_upper" not in df2.columns and "Ticker" in df2.columns:
@@ -369,14 +442,18 @@ def ask_ai_about_view(
     context_text: str,
     user_question: str,
     model: str = "gpt-4.1-mini",
+    enforce_numeric_grounding: bool = False,
+    allow_extra_numbers: Optional[List[str]] = None,
 ) -> ChatResult:
     """
     Thin wrapper around Responses API call; returns a ChatResult.
     """
     system_instructions = (
         "You are a quantitative markets analyst helping a user interpret a Streamlit dashboard. "
-        "Use ONLY the provided context. Be numerically concrete and concise. "
-        "If the user asks for something not present in context, say so plainly and suggest what to highlight or change."
+        "Use ONLY the provided context. "
+        "CRITICAL: Do NOT introduce any numeric value (including percentages) that does not appear verbatim in the CONTEXT. "
+        "If a requested number is not present in context, say you don't have it and suggest what to highlight or which column to consult. "
+        "Be numerically concrete and concise."
     )
 
     try:
@@ -386,6 +463,21 @@ def ask_ai_about_view(
             input=f"CONTEXT:\n{context_text}\n\nUSER_QUESTION:\n{user_question}",
         )
         answer = getattr(resp, "output_text", None) or ""
+
+        if enforce_numeric_grounding:
+            ok_nums, unexpected = validate_answer_numbers(
+                context_text=context_text,
+                answer_text=answer,
+                allow_extra=allow_extra_numbers,
+            )
+            if not ok_nums:
+                msg = (
+                    "AI response contained numbers not present in the provided context. "
+                    f"Unexpected numbers: {unexpected}. "
+                    "Please adjust highlights/filters and try again."
+                )
+                return ChatResult(ok=False, answer=msg, error="numeric_grounding_failed", context_text=context_text)
+
         return ChatResult(ok=True, answer=answer, context_text=context_text)
     except Exception as e:
         return ChatResult(ok=False, answer=f"Error calling OpenAI API: {e}", error=str(e), context_text=context_text)
