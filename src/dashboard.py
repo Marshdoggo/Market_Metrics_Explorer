@@ -14,6 +14,7 @@ import streamlit as st
 import pandas as pd
 import json
 import requests
+import hashlib
 from datetime import date
 import matplotlib.pyplot as plt
 from scipy.cluster.hierarchy import linkage, dendrogram
@@ -39,6 +40,8 @@ from ai_context import (
     build_view_context_text,
     ask_ai_about_view,
 )
+from health_status import build_dashboard_health
+from status_store import list_recent_reports
 # ------------------------------------------------------------------------------
 
 
@@ -99,6 +102,40 @@ def _safe_date_bounds(prices):
 st.set_page_config(page_title='S&P 500 Metric Explorer', layout='wide')
 
 st.title('📈 Market Metric Explorer')
+
+health = build_dashboard_health()
+health_state = health.get("state")
+health_title = health.get("title", "Pipeline health status unavailable.")
+health_summary = health.get("summary", "")
+health_details = health.get("details") or []
+
+if health_state == "error":
+    st.error(f"{health_title} {health_summary}".strip())
+elif health_state == "warning":
+    st.warning(f"{health_title} {health_summary}".strip())
+else:
+    st.success(f"{health_title} {health_summary}".strip())
+
+with st.expander("Pipeline health details", expanded=False):
+    latest_run = health.get("latest_run")
+    if latest_run:
+        st.caption(
+            f"Latest repo-local run: {latest_run.get('status')}  •  "
+            f"started {latest_run.get('started_at')}  •  "
+            f"finished {latest_run.get('finished_at') or '(in progress)'}"
+        )
+        if latest_run.get("error_summary"):
+            st.caption(f"Last error: {latest_run.get('error_summary')}")
+    else:
+        st.caption("No repo-local pipeline runs are recorded yet.")
+
+    for detail in health_details:
+        st.caption(detail)
+
+    recent_runs = health.get("recent_runs") or []
+    if recent_runs:
+        recent_df = pd.DataFrame(recent_runs)
+        st.dataframe(recent_df, use_container_width=True, hide_index=True)
 
 with st.sidebar:
     st.header('Settings')
@@ -558,11 +595,62 @@ else:
 st.markdown('---')
 st.subheader('🗞️ Daily Reports')
 
+# --- Digest helpers: verify publisher report facts match the UI metrics_df -------
+
+def _stable_df_digest(df: pd.DataFrame) -> str:
+    """Create a short, stable digest for a metrics dataframe.
+
+    This lets us verify whether a publisher facts.json was derived from the *same*
+    metrics used to render the UI table.
+    """
+    if df is None or getattr(df, 'empty', True):
+        return "(empty)"
+
+    # Prefer a small but informative subset of columns that should exist in the UI.
+    preferred_cols = [
+        'Ticker',
+        'Annualized Sharpe',
+        'Daily Volatility (Std)',
+        'Max Drawdown',
+        'RSI(14)',
+        'RSI(1)',
+        'CAGR',
+    ]
+    cols = [c for c in preferred_cols if c in df.columns]
+    if 'Ticker' not in cols:
+        cols = ['Ticker'] + cols
+
+    x = df[cols].copy()
+    x['Ticker'] = x['Ticker'].astype(str).str.upper()
+
+    # Sort deterministically, and round numeric values for stability
+    for c in cols:
+        if c == 'Ticker':
+            continue
+        try:
+            x[c] = pd.to_numeric(x[c], errors='coerce').round(8)
+        except Exception:
+            pass
+
+    x = x.sort_values('Ticker')
+    payload = x.to_csv(index=False).encode('utf-8')
+    return hashlib.sha256(payload).hexdigest()[:12]
+
+
+def _pick_first(d: dict, keys):
+    for k in keys:
+        if k in d:
+            return d.get(k)
+    return None
+
+# ------------------------------------------------------------------------------
+
 # Reports are published by the mktme_publisher workflow into the mktme-data repo.
 DEFAULT_REPORTS_INDEX = (
     "https://raw.githubusercontent.com/marshdoggo/mktme-data/main/reports/index.json"
 )
 REPORTS_INDEX_URL = os.environ.get("MKTME_REPORTS_INDEX_URL", DEFAULT_REPORTS_INDEX)
+DEFAULT_REPORTS_BASE_URL = "https://raw.githubusercontent.com/marshdoggo/mktme-data/main"
 
 @st.cache_data(ttl=5*60)
 def _load_reports_index(url: str, cache_key: str) -> dict:
@@ -591,28 +679,44 @@ try:
 except Exception:
     idx = None
 
-if idx is None or not isinstance(idx, dict) or "universes" not in idx:
+sqlite_report_entries = [
+    {
+        "date": rec.get("asof_date"),
+        "md": rec.get("markdown_path"),
+        "json": rec.get("json_path"),
+        "facts": rec.get("facts_path"),
+    }
+    for rec in list_recent_reports(universe, limit=14)
+]
+
+if (idx is None or not isinstance(idx, dict) or "universes" not in idx) and not sqlite_report_entries:
     st.info(
         "No published reports found yet. Once your publisher workflow runs, it should create "
         "`mktme-data/reports/index.json` plus `reports/<universe>/<YYYY-MM-DD>.md`. "
         "After that, this section will populate automatically."
     )
 else:
-    uni_map = idx.get("universes", {})
+    uni_map = idx.get("universes", {}) if isinstance(idx, dict) else {}
     entries = uni_map.get(universe, []) if isinstance(uni_map, dict) else []
 
     # Controls
     c1, c2, c3 = st.columns([2, 1, 1])
     with c1:
-        st.caption(f"Source: {REPORTS_INDEX_URL}")
+        if sqlite_report_entries:
+            st.caption("Source of truth: SQLite runtime metadata. Artifact files still resolve from mktme-data raw URLs.")
+        else:
+            st.caption(f"Source: {REPORTS_INDEX_URL}")
     with c2:
         show_n = st.selectbox("Show", [3, 5, 10, 14], index=1, help="How many recent reports to show")
     with c3:
         debug_reports = st.checkbox(
             "Debug",
             value=False,
-            help="Compare the publisher's facts.json to the metrics in the current UI table when dates match."
+            help="Compare publisher facts.json to the UI metrics when dates match, and show a digest check to detect mismatched metric tables."
         )
+
+    if sqlite_report_entries:
+        entries = sqlite_report_entries[: int(show_n)]
 
     if not entries:
         st.info(
@@ -621,12 +725,13 @@ else:
         )
     else:
         # base_url can be provided by the publisher; otherwise derive from index URL.
-        base_url = idx.get("base_url")
+        base_url = idx.get("base_url") if isinstance(idx, dict) else None
         if not base_url:
             # crude fallback: trim to repo root
-            base_url = "https://raw.githubusercontent.com/marshdoggo/mktme-data/main"
+            base_url = DEFAULT_REPORTS_BASE_URL
 
-        entries = entries[: int(show_n)]
+        if not sqlite_report_entries:
+            entries = entries[: int(show_n)]
 
         # Most recent report preview at top
         latest = entries[0]
@@ -690,6 +795,23 @@ else:
                                     "Switch your UI As-of date to the report date (and same lookback) to compare cleanly."
                                 )
                             else:
+                                # Digest check: if facts.json exposes a digest, compare to UI digest
+                                facts_digest = _pick_first(facts, ['data_digest', 'digest', 'df_digest'])
+                                ui_digest = _stable_df_digest(metrics_df_A if 'metrics_df_A' in locals() else None)
+
+                                dig_cols = st.columns(2)
+                                with dig_cols[0]:
+                                    st.caption(f"UI digest: {ui_digest}")
+                                with dig_cols[1]:
+                                    st.caption(f"facts digest: {facts_digest or '(missing)'}")
+
+                                if facts_digest and str(facts_digest) != str(ui_digest):
+                                    st.warning(
+                                        "Digest mismatch: the publisher report appears to be derived from a different "
+                                        "metrics table than what the UI is currently showing. The report numbers are not "
+                                        "trustworthy until the publisher uses the same metrics dataframe as the UI."
+                                    )
+
                                 # Extract leader rows from facts in a schema-tolerant way
                                 leaders = (
                                     facts.get('leaders')
@@ -698,23 +820,21 @@ else:
                                     or (facts.get('sections', {}) or {}).get('leaders')
                                 )
 
-                                leader_rows = []
+                                leaders_list = []
                                 if isinstance(leaders, list):
-                                    leader_rows = leaders
+                                    leaders_list = leaders
                                 elif isinstance(leaders, dict):
-                                    # if dict, prefer a common key
                                     for k in ['top_by_sharpe', 'sharpe', 'annualized_sharpe', 'items']:
                                         v = leaders.get(k)
                                         if isinstance(v, list):
-                                            leader_rows = v
+                                            leaders_list = v
                                             break
 
                                 # Build a comparison table using current UI metrics_df_A
-                                if leader_rows and 'metrics_df_A' in locals():
+                                if leaders_list and 'metrics_df_A' in locals():
                                     ui_df = metrics_df_A.copy()
                                     ui_df['Ticker_upper'] = ui_df['Ticker'].astype(str).str.upper()
 
-                                    # Helper to pull a numeric value from a leader row for a given set of candidate keys
                                     def _pick_num(row: dict, keys):
                                         for kk in keys:
                                             if kk in row:
@@ -724,7 +844,8 @@ else:
                                                     return None
                                         return None
 
-                                    for r in leader_rows[:10]:
+                                    cmp_rows = []
+                                    for r in leaders_list[:10]:
                                         if not isinstance(r, dict):
                                             continue
                                         t = (r.get('ticker') or r.get('Ticker') or r.get('symbol') or '').strip()
@@ -760,11 +881,11 @@ else:
                                             except Exception:
                                                 ui_dd = None
 
-                                        leader_rows_name = r.get('name') or r.get('Name') or ui_row.get('Name', '')
+                                        nm = r.get('name') or r.get('Name') or ui_row.get('Name', '')
 
-                                        leader_rows_out = {
+                                        cmp_rows.append({
                                             'Ticker': tu,
-                                            'Name': leader_rows_name,
+                                            'Name': nm,
                                             'Sharpe (facts)': fact_sharpe,
                                             'Sharpe (UI)': ui_sharpe,
                                             'Δ Sharpe': (None if (fact_sharpe is None or ui_sharpe is None) else (fact_sharpe - ui_sharpe)),
@@ -774,16 +895,19 @@ else:
                                             'MaxDD (facts)': fact_dd,
                                             'MaxDD (UI)': ui_dd,
                                             'Δ MaxDD': (None if (fact_dd is None or ui_dd is None) else (fact_dd - ui_dd)),
-                                        }
-                                        leader_rows.append(leader_rows_out)
+                                        })
 
-                                    if leader_rows:
-                                        cmp = pd.DataFrame(leader_rows)
+                                    if cmp_rows:
+                                        cmp = pd.DataFrame(cmp_rows)
+                                        # round numeric columns for readability
+                                        for c in ['Sharpe (facts)', 'Sharpe (UI)', 'Δ Sharpe', 'Vol (facts)', 'Vol (UI)', 'Δ Vol', 'MaxDD (facts)', 'MaxDD (UI)', 'Δ MaxDD']:
+                                            if c in cmp.columns:
+                                                cmp[c] = pd.to_numeric(cmp[c], errors='coerce').round(6)
                                         st.dataframe(cmp)
                                     else:
-                                        st.caption('No comparable leader rows found in facts.json (schema mismatch) or tickers not present in UI frame.')
+                                        st.caption('No comparable leader rows found (schema mismatch) or tickers not present in the UI frame.')
                                 else:
-                                    st.caption('facts.json did not expose a recognizable leaders list to compare.')
+                                    st.caption('facts.json did not expose a recognizable leaders list to compare, or UI metrics were not available.')
 
             except Exception as e:
                 st.warning(f"Could not load latest report markdown: {e}")
