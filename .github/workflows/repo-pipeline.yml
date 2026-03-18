@@ -28,7 +28,6 @@ jobs:
         with:
           repository: Marshdoggo/mktme-data
           path: mktme_data
-          token: ${{ secrets.PUBLISHER_PAT }}
 
       - name: Install dependencies
         run: |
@@ -41,6 +40,7 @@ jobs:
           MKTME_DATA_REPO: ${{ github.workspace }}/mktme_data
           MKTME_GITHUB_USER: marshdoggo
           MKTME_FORCE_REFRESH: "1"
+          MKTME_PREFER_STOOQ: "1"
         run: |
           python -m pipeline.publish_legacy_artifacts --universes sp500
 
