@@ -28,6 +28,7 @@ jobs:
         with:
           repository: Marshdoggo/mktme-data
           path: mktme_data
+          persist-credentials: false
 
       - name: Install dependencies
         run: |
@@ -45,8 +46,14 @@ jobs:
           python -m pipeline.publish_legacy_artifacts --universes sp500
 
       - name: Commit and push mktme-data
+        env:
+          PUBLISHER_PAT: ${{ secrets.PUBLISHER_PAT }}
         run: |
           cd mktme_data
+          if [ -z "$PUBLISHER_PAT" ]; then
+            echo "PUBLISHER_PAT is missing."
+            exit 1
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A sp500/prices.parquet manifest.json reports/
@@ -54,7 +61,8 @@ jobs:
             echo "No mktme-data changes to commit."
           else
             git commit -m "chore: publish legacy artifacts"
-            git push https://marshdoggo:${{ secrets.PUBLISHER_PAT }}@github.com/Marshdoggo/mktme-data.git HEAD:main
+            git remote set-url origin "https://x-access-token:${PUBLISHER_PAT}@github.com/Marshdoggo/mktme-data.git"
+            git push origin HEAD:main
           fi
 
       - name: Commit pipeline status artifacts
