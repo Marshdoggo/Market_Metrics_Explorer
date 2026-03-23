@@ -291,6 +291,36 @@ with col3:
     if color_by == '(None)':
         color_by = None
 
+with st.sidebar:
+    st.markdown('---')
+    st.header('Chart View')
+    axis_focus_pct = st.slider(
+        'Axis focus (%)',
+        min_value=60,
+        max_value=100,
+        value=100,
+        step=5,
+        help='100% uses the full data range. Lower values trim the most extreme outliers from the plotted axis range so clustered points look more spread out.'
+    )
+    axis_padding_pct = st.slider(
+        'Axis padding (%)',
+        min_value=0,
+        max_value=20,
+        value=5,
+        step=1,
+        help='Adds breathing room around the visible plotted range.'
+    )
+    log_x = st.checkbox(
+        'Log scale X axis',
+        value=False,
+        help='Uses a logarithmic X axis when all plotted X values are positive.'
+    )
+    log_y = st.checkbox(
+        'Log scale Y axis',
+        value=False,
+        help='Uses a logarithmic Y axis when all plotted Y values are positive.'
+    )
+
 # --- Metric docs & quadrant guide -------------------------------------------------
 with st.expander('🧭 How to read this view (metric docs + quadrant guide)', expanded=False):
     guide = get_pair_guide(x_metric, y_metric)
@@ -332,6 +362,33 @@ metrics_df_A = build_metrics_df(prices, asof_ts)
 metrics_df = metrics_df_A  # keep old name for downstream references when not comparing
 metrics_df_B = build_metrics_df(prices, asof2_ts) if compare and asof2_ts is not None else None
 
+def _compute_axis_ranges(df_local: pd.DataFrame, x: str, y: str, focus_pct: int, padding_pct: int):
+    sx = pd.to_numeric(df_local[x], errors='coerce').dropna()
+    sy = pd.to_numeric(df_local[y], errors='coerce').dropna()
+    if sx.empty or sy.empty:
+        return None
+
+    def _bounds(series: pd.Series):
+        if focus_pct >= 100:
+            lo = float(series.min())
+            hi = float(series.max())
+        else:
+            trim_each_side = max(0.0, (100 - focus_pct) / 200.0)
+            lo = float(series.quantile(trim_each_side))
+            hi = float(series.quantile(1.0 - trim_each_side))
+
+        if hi == lo:
+            base = abs(lo) if lo != 0 else 1.0
+            pad = base * max(padding_pct / 100.0, 0.05)
+        else:
+            pad = (hi - lo) * (padding_pct / 100.0)
+        return [lo - pad, hi + pad]
+
+    return {
+        'x': _bounds(sx),
+        'y': _bounds(sy),
+    }
+
 def render_view(title_label: str, metrics_df_local: pd.DataFrame, axis_ranges=None):
     # Plot
     cols_needed = [x_metric, y_metric, 'Sector', 'SubIndustry', 'Ticker', 'Name', 'Ticker_upper', 'IsHighlighted']
@@ -345,6 +402,8 @@ def render_view(title_label: str, metrics_df_local: pd.DataFrame, axis_ranges=No
 
     plot_df_local = metrics_df_local[present].dropna(subset=[x_metric, y_metric])
     st.subheader(title_label)
+    can_log_x = bool((plot_df_local[x_metric] > 0).all()) if not plot_df_local.empty else False
+    can_log_y = bool((plot_df_local[y_metric] > 0).all()) if not plot_df_local.empty else False
     if interactive:
         from plot_metrics import scatter_xy_interactive
         import plotly.express as px
@@ -355,6 +414,14 @@ def render_view(title_label: str, metrics_df_local: pd.DataFrame, axis_ranges=No
                 fig.update_xaxes(range=axis_ranges['x'])
             if 'y' in axis_ranges and axis_ranges['y'] is not None:
                 fig.update_yaxes(range=axis_ranges['y'])
+        if log_x and can_log_x:
+            fig.update_xaxes(type='log')
+        elif log_x and not can_log_x:
+            st.caption(f'Log scale unavailable for X because {x_metric} includes zero or negative values in this view.')
+        if log_y and can_log_y:
+            fig.update_yaxes(type='log')
+        elif log_y and not can_log_y:
+            st.caption(f'Log scale unavailable for Y because {y_metric} includes zero or negative values in this view.')
         if highlight:
             fig.update_traces(marker=dict(opacity=0.35))
             hi = plot_df_local[plot_df_local['IsHighlighted']]
@@ -418,6 +485,19 @@ def render_view(title_label: str, metrics_df_local: pd.DataFrame, axis_ranges=No
             )
     else:
         fig, ax = scatter_xy(plot_df_local, x=x_metric, y=y_metric, color_by=(color_by or ''), title=f"{y_metric} vs {x_metric}")
+        if axis_ranges is not None:
+            if 'x' in axis_ranges and axis_ranges['x'] is not None:
+                ax.set_xlim(axis_ranges['x'])
+            if 'y' in axis_ranges and axis_ranges['y'] is not None:
+                ax.set_ylim(axis_ranges['y'])
+        if log_x and can_log_x:
+            ax.set_xscale('log')
+        elif log_x and not can_log_x:
+            st.caption(f'Log scale unavailable for X because {x_metric} includes zero or negative values in this view.')
+        if log_y and can_log_y:
+            ax.set_yscale('log')
+        elif log_y and not can_log_y:
+            st.caption(f'Log scale unavailable for Y because {y_metric} includes zero or negative values in this view.')
         st.pyplot(fig)
 
     # Selected vs Peers (for this view)
@@ -467,36 +547,33 @@ def render_view(title_label: str, metrics_df_local: pd.DataFrame, axis_ranges=No
 # Compute shared axis ranges if requested
 axis_ranges_shared = None
 if compare and metrics_df_B is not None and 'sync_axes' in locals() and sync_axes:
-    def _get_xy_extents(df_local: pd.DataFrame, x: str, y: str):
-        sx = df_local[x].dropna()
-        sy = df_local[y].dropna()
-        if sx.empty or sy.empty:
-            return None
-        return sx.min(), sx.max(), sy.min(), sy.max()
-    extA = _get_xy_extents(metrics_df_A, x_metric, y_metric)
-    extB = _get_xy_extents(metrics_df_B, x_metric, y_metric)
-    if extA and extB:
-        xmin = min(extA[0], extB[0]); xmax = max(extA[1], extB[1])
-        ymin = min(extA[2], extB[2]); ymax = max(extA[3], extB[3])
-        # Add 5% padding
-        xr = xmax - xmin; yr = ymax - ymin
-        pad_x = xr * 0.05 if xr > 0 else 0.01
-        pad_y = yr * 0.05 if yr > 0 else 0.01
+    axisA = _compute_axis_ranges(metrics_df_A, x_metric, y_metric, axis_focus_pct, axis_padding_pct)
+    axisB = _compute_axis_ranges(metrics_df_B, x_metric, y_metric, axis_focus_pct, axis_padding_pct)
+    if axisA and axisB:
         axis_ranges_shared = {
-            'x': [float(xmin - pad_x), float(xmax + pad_x)],
-            'y': [float(ymin - pad_y), float(ymax + pad_y)],
+            'x': [
+                float(min(axisA['x'][0], axisB['x'][0])),
+                float(max(axisA['x'][1], axisB['x'][1])),
+            ],
+            'y': [
+                float(min(axisA['y'][0], axisB['y'][0])),
+                float(max(axisA['y'][1], axisB['y'][1])),
+            ],
         }
+
+axis_ranges_A = axis_ranges_shared or _compute_axis_ranges(metrics_df_A, x_metric, y_metric, axis_focus_pct, axis_padding_pct)
+axis_ranges_B = axis_ranges_shared or (_compute_axis_ranges(metrics_df_B, x_metric, y_metric, axis_focus_pct, axis_padding_pct) if metrics_df_B is not None else None)
 
 st.markdown('---')
 
 if compare and metrics_df_B is not None:
     colA, colB = st.columns(2)
     with colA:
-        render_view(f"View A — {asof_ts.date()} :: {y_metric} vs {x_metric}", metrics_df_A, axis_ranges=axis_ranges_shared)
+        render_view(f"View A — {asof_ts.date()} :: {y_metric} vs {x_metric}", metrics_df_A, axis_ranges=axis_ranges_A)
     with colB:
-        render_view(f"View B — {asof2_ts.date()} :: {y_metric} vs {x_metric}", metrics_df_B, axis_ranges=axis_ranges_shared)
+        render_view(f"View B — {asof2_ts.date()} :: {y_metric} vs {x_metric}", metrics_df_B, axis_ranges=axis_ranges_B)
 else:
-    render_view(f"{y_metric} vs {x_metric}", metrics_df_A)
+    render_view(f"{y_metric} vs {x_metric}", metrics_df_A, axis_ranges=axis_ranges_A)
 
 # --- Delta panel: compare highlighted tickers A → B ---
 if compare and metrics_df_B is not None and highlight:
