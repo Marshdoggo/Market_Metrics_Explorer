@@ -424,11 +424,11 @@ def _download_twelvedata(symbols: List[str], start=None, end=None) -> pd.DataFra
         )
 
     batch_size = max(1, TWELVEDATA_PER_MINUTE)
-    sleep_s = 0.0 if TWELVEDATA_PER_MINUTE <= 0 else max(0.0, 60.0 / TWELVEDATA_PER_MINUTE)
     frames: list[pd.DataFrame] = []
     session = requests.Session()
+    chunks = _chunk(symbols, batch_size)
 
-    for i, chunk in enumerate(_chunk(symbols, batch_size), 1):
+    for i, chunk in enumerate(chunks, 1):
         params = {
             "symbol": ",".join(_twelvedata_symbol(sym) for sym in chunk),
             "interval": "1day",
@@ -482,8 +482,9 @@ def _download_twelvedata(symbols: List[str], start=None, end=None) -> pd.DataFra
             )
 
         frames.extend(batch_frames)
-        _log(f"[fetch_data] Twelve Data batch {i}/{len(_chunk(symbols, batch_size))}: {len(batch_frames)} symbols")
-        if i < len(_chunk(symbols, batch_size)) and sleep_s > 0:
+        _log(f"[fetch_data] Twelve Data batch {i}/{len(chunks)}: {len(batch_frames)} symbols")
+        if i < len(chunks) and TWELVEDATA_PER_MINUTE > 0:
+            sleep_s = 60.0 * (len(chunk) / float(TWELVEDATA_PER_MINUTE))
             time.sleep(sleep_s)
 
     return _safe_concat_price_frames(frames)
