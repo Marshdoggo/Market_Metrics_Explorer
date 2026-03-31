@@ -21,6 +21,15 @@ PREFER_STOOQ_DEFAULT = (
     os.getenv("MKTME_PREFER_STOOQ", "").lower() in ("1", "true", "yes")
     or RUNNING_IN_CLOUD
 )
+EQUITY_SOURCE_DEFAULT = os.getenv("MKTME_EQUITY_SOURCE", "auto").strip().lower() or "auto"
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
+ALPHAVANTAGE_DAILY_LIMIT = int(os.getenv("ALPHAVANTAGE_DAILY_LIMIT", "25") or 25)
+ALPHAVANTAGE_PER_MINUTE = int(os.getenv("ALPHAVANTAGE_PER_MINUTE", "5") or 5)
+ALPHAVANTAGE_PREMIUM = os.getenv("ALPHAVANTAGE_PREMIUM", "").lower() in ("1", "true", "yes")
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
+TWELVEDATA_DAILY_LIMIT = int(os.getenv("TWELVEDATA_DAILY_LIMIT", "800") or 800)
+TWELVEDATA_PER_MINUTE = int(os.getenv("TWELVEDATA_PER_MINUTE", "8") or 8)
+TWELVEDATA_OUTPUTSIZE = int(os.getenv("TWELVEDATA_OUTPUTSIZE", "3000") or 3000)
 MAX_SYMBOLS_DEFAULT = int(os.getenv("MKTME_MAX_SYMBOLS", "0") or 0)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
@@ -310,6 +319,176 @@ def _download_stooq(symbols: List[str], start=None, end=None) -> pd.DataFrame:
     return out
 
 
+def _alpha_vantage_series_key(payload: dict) -> str | None:
+    for key in payload.keys():
+        if "Time Series" in key:
+            return key
+    return None
+
+
+def _download_alpha_vantage(symbols: List[str], start=None, end=None) -> pd.DataFrame:
+    if not ALPHAVANTAGE_API_KEY:
+        raise RuntimeError(
+            "MKTME_EQUITY_SOURCE=alphavantage but ALPHAVANTAGE_API_KEY is not set."
+        )
+    if not ALPHAVANTAGE_PREMIUM:
+        if len(symbols) > ALPHAVANTAGE_DAILY_LIMIT:
+            raise RuntimeError(
+                "Alpha Vantage free tier cannot refresh this universe: "
+                f"{len(symbols)} symbols requested but the documented free limit is "
+                f"{ALPHAVANTAGE_DAILY_LIMIT} requests/day."
+            )
+        if start is None and end is None:
+            raise RuntimeError(
+                "Alpha Vantage free tier only provides compact daily history "
+                "(latest 100 data points) for TIME_SERIES_DAILY. "
+                "This pipeline needs longer history for the 252-trading-day metrics."
+            )
+        if start is not None and end is not None:
+            requested_span = (pd.Timestamp(end) - pd.Timestamp(start)).days
+            if requested_span > 140:
+                raise RuntimeError(
+                    "Alpha Vantage free tier only provides compact daily history "
+                    "(latest 100 data points), which is insufficient for this requested window."
+                )
+
+    session = requests.Session()
+    sleep_s = 0.0 if ALPHAVANTAGE_PER_MINUTE <= 0 else max(0.0, 60.0 / ALPHAVANTAGE_PER_MINUTE)
+    frames: list[pd.DataFrame] = []
+
+    for idx, sym in enumerate(symbols):
+        params = {
+            "function": "TIME_SERIES_DAILY_ADJUSTED" if ALPHAVANTAGE_PREMIUM else "TIME_SERIES_DAILY",
+            "symbol": sym,
+            "apikey": ALPHAVANTAGE_API_KEY,
+            "datatype": "json",
+            "outputsize": "full" if ALPHAVANTAGE_PREMIUM else "compact",
+        }
+        resp = session.get("https://www.alphavantage.co/query", params=params, timeout=60)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        if payload.get("Error Message"):
+            raise RuntimeError(f"Alpha Vantage error for {sym}: {payload['Error Message']}")
+        if payload.get("Note"):
+            raise RuntimeError(f"Alpha Vantage rate limit response for {sym}: {payload['Note']}")
+        if payload.get("Information"):
+            raise RuntimeError(f"Alpha Vantage info response for {sym}: {payload['Information']}")
+
+        series_key = _alpha_vantage_series_key(payload)
+        if not series_key:
+            raise RuntimeError(f"Alpha Vantage returned no time series for {sym}.")
+
+        ts = payload.get(series_key) or {}
+        if not ts:
+            raise RuntimeError(f"Alpha Vantage returned an empty time series for {sym}.")
+
+        field = "5. adjusted close" if ALPHAVANTAGE_PREMIUM else "4. close"
+        s = pd.Series({k: float(v[field]) for k, v in ts.items() if field in v}, name=sym)
+        one = s.to_frame()
+        one.index = pd.to_datetime(one.index, errors="coerce")
+        one = one[~one.index.isna()].sort_index()
+        if start is not None:
+            one = one[one.index >= pd.Timestamp(start)]
+        if end is not None:
+            one = one[one.index <= pd.Timestamp(end)]
+        if one.empty:
+            raise RuntimeError(f"Alpha Vantage returned no usable rows for {sym} after filtering.")
+        frames.append(one)
+
+        if idx < len(symbols) - 1 and sleep_s > 0:
+            time.sleep(sleep_s)
+
+    return _safe_concat_price_frames(frames)
+
+
+def _twelvedata_symbol(symbol: str) -> str:
+    s = str(symbol).strip().upper()
+    if s.endswith("=X"):
+        s = s[:-2]
+    if len(s) == 6 and "/" not in s and s.isalpha():
+        # EURUSD -> EUR/USD for FX
+        return f"{s[:3]}/{s[3:]}"
+    return s
+
+
+def _download_twelvedata(symbols: List[str], start=None, end=None) -> pd.DataFrame:
+    if not TWELVEDATA_API_KEY:
+        raise RuntimeError(
+            "MKTME_EQUITY_SOURCE=twelvedata but TWELVEDATA_API_KEY is not set."
+        )
+    if len(symbols) > TWELVEDATA_DAILY_LIMIT:
+        raise RuntimeError(
+            f"Twelve Data daily credit budget exceeded: {len(symbols)} symbols requested "
+            f"but TWELVEDATA_DAILY_LIMIT={TWELVEDATA_DAILY_LIMIT}."
+        )
+
+    batch_size = max(1, TWELVEDATA_PER_MINUTE)
+    sleep_s = 0.0 if TWELVEDATA_PER_MINUTE <= 0 else max(0.0, 60.0 / TWELVEDATA_PER_MINUTE)
+    frames: list[pd.DataFrame] = []
+    session = requests.Session()
+
+    for i, chunk in enumerate(_chunk(symbols, batch_size), 1):
+        params = {
+            "symbol": ",".join(_twelvedata_symbol(sym) for sym in chunk),
+            "interval": "1day",
+            "outputsize": int(TWELVEDATA_OUTPUTSIZE),
+            "order": "asc",
+            "apikey": TWELVEDATA_API_KEY,
+        }
+        if start is not None:
+            params["start_date"] = pd.Timestamp(start).strftime("%Y-%m-%d")
+        if end is not None:
+            params["end_date"] = pd.Timestamp(end).strftime("%Y-%m-%d")
+
+        resp = session.get("https://api.twelvedata.com/time_series", params=params, timeout=90)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            raise RuntimeError(f"Twelve Data error: {payload.get('message') or payload}")
+
+        batch_frames: list[pd.DataFrame] = []
+        batch_errors: list[str] = []
+        for sym in chunk:
+            key = _twelvedata_symbol(sym)
+            item = payload.get(key)
+            if not isinstance(item, dict):
+                batch_errors.append(f"{sym}: missing batch payload")
+                continue
+            if item.get("status") == "error":
+                batch_errors.append(f"{sym}: {item.get('message') or 'unknown error'}")
+                continue
+            values = item.get("values") or []
+            if not values:
+                batch_errors.append(f"{sym}: no values returned")
+                continue
+            one = pd.DataFrame(values)
+            if "close" not in one.columns or "datetime" not in one.columns:
+                batch_errors.append(f"{sym}: malformed response")
+                continue
+            one["datetime"] = pd.to_datetime(one["datetime"], errors="coerce")
+            one["close"] = pd.to_numeric(one["close"], errors="coerce")
+            one = one.dropna(subset=["datetime", "close"]).set_index("datetime")[["close"]]
+            one.columns = [sym]
+            if one.empty:
+                batch_errors.append(f"{sym}: no usable rows after parsing")
+                continue
+            batch_frames.append(one)
+
+        if batch_errors:
+            raise RuntimeError(
+                "Twelve Data batch returned errors: " + "; ".join(batch_errors[:10])
+            )
+
+        frames.extend(batch_frames)
+        _log(f"[fetch_data] Twelve Data batch {i}/{len(_chunk(symbols, batch_size))}: {len(batch_frames)} symbols")
+        if i < len(_chunk(symbols, batch_size)) and sleep_s > 0:
+            time.sleep(sleep_s)
+
+    return _safe_concat_price_frames(frames)
+
+
 def _probe_live_equity_sources() -> tuple[pd.DataFrame, pd.DataFrame]:
     end = pd.Timestamp.utcnow().normalize().tz_localize(None)
     start = end - pd.Timedelta(days=14)
@@ -352,9 +531,17 @@ def download_prices(
     start = _to_naive_ts(start)
     end   = _to_naive_ts(end)
 
+    equity_source = EQUITY_SOURCE_DEFAULT
+
     # Apply environment-driven defaults
     if prefer_stooq is None:
         prefer_stooq = PREFER_STOOQ_DEFAULT
+
+    if equity_source == "twelvedata":
+        return _download_twelvedata(symbols, start=start, end=end)
+
+    if equity_source == "alphavantage":
+        return _download_alpha_vantage(symbols, start=start, end=end)
 
     if force_refresh and not prefer_stooq:
         yahoo_probe, stooq_probe = _probe_live_equity_sources()
@@ -602,6 +789,12 @@ def download_prices_fx_window(
     """
     Windowed FX fetch using yfinance (close). Returns wide DF columns=pairs.
     """
+    if EQUITY_SOURCE_DEFAULT == "twelvedata":
+        end = pd.Timestamp(asof).normalize()
+        from pandas.tseries.offsets import BDay
+        start = (end - BDay(int(lookback_trading_days))).normalize()
+        return _download_twelvedata(pairs, start=start, end=end)
+
     yf_syms = [_fx_to_yf_symbol(p) for p in pairs]
     end = pd.Timestamp(asof).normalize()
     # Use business days as in dashboard:

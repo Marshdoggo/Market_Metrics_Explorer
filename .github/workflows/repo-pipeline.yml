@@ -45,8 +45,13 @@ jobs:
           MKTME_DATA_REPO: ${{ github.workspace }}/mktme_data
           MKTME_GITHUB_USER: marshdoggo
           MKTME_FORCE_REFRESH: "1"
+          MKTME_EQUITY_SOURCE: "twelvedata"
+          TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
+          TWELVEDATA_DAILY_LIMIT: ${{ vars.TWELVEDATA_DAILY_LIMIT || '800' }}
+          TWELVEDATA_PER_MINUTE: ${{ vars.TWELVEDATA_PER_MINUTE || '8' }}
+          TWELVEDATA_OUTPUTSIZE: ${{ vars.TWELVEDATA_OUTPUTSIZE || '3000' }}
         run: |
-          python -m pipeline.publish_legacy_artifacts --universes sp500
+          python -m pipeline.publish_legacy_artifacts --universes sp500 nasdaq100 dow30 fx
 
       - name: Commit and push mktme-data
         env:
@@ -59,7 +64,7 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A sp500/prices.parquet manifest.json reports/
+          git add -A sp500/ nasdaq100/ dow30/ fx/ manifest.json reports/
           if git diff --cached --quiet; then
             echo "No mktme-data changes to commit."
           else
