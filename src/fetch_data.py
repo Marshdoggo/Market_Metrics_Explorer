@@ -338,6 +338,8 @@ def download_prices(
         # Never allow the argument to disable the env flag; only to enable.
         force_refresh = bool(force_refresh) or FORCE_REFRESH
 
+    use_disk_cache = not force_refresh
+
     start = _to_naive_ts(start)
     end   = _to_naive_ts(end)
 
@@ -351,7 +353,7 @@ def download_prices(
         symbols = symbols[:MAX_SYMBOLS_DEFAULT]
 
     # Serve cache if available and not forcing refresh
-    if os.path.exists(PRICES_PARQUET) and not force_refresh:
+    if os.path.exists(PRICES_PARQUET) and use_disk_cache:
         try:
             cached = pd.read_parquet(PRICES_PARQUET)
             if not cached.empty:
@@ -389,7 +391,7 @@ def download_prices(
                 # Write progressive cache so subsequent runs can reuse partial data
                 try:
                     partial = _safe_concat_price_frames(frames)
-                    if os.path.exists(PRICES_PARQUET):
+                    if os.path.exists(PRICES_PARQUET) and use_disk_cache:
                         base = pd.read_parquet(PRICES_PARQUET)
                         partial = base.combine_first(partial).combine_first(partial)
                     partial.to_parquet(PRICES_PARQUET)
@@ -398,7 +400,7 @@ def download_prices(
         out = _safe_concat_price_frames(frames)
 
         # Merge with existing cache so we don’t lose previously-fetched columns
-        if os.path.exists(PRICES_PARQUET):
+        if os.path.exists(PRICES_PARQUET) and use_disk_cache:
             try:
                 base = pd.read_parquet(PRICES_PARQUET)
                 out = base.combine_first(out).combine_first(out)
@@ -441,7 +443,7 @@ def download_prices(
                 # Progressive cache write for partial progress on Cloud
                 try:
                     partial = _safe_concat_price_frames(all_frames)
-                    if os.path.exists(PRICES_PARQUET):
+                    if os.path.exists(PRICES_PARQUET) and use_disk_cache:
                         base = pd.read_parquet(PRICES_PARQUET)
                         partial = base.combine_first(partial).combine_first(partial)
                     partial.to_parquet(PRICES_PARQUET)
@@ -459,7 +461,7 @@ def download_prices(
                 # Progressive cache write for partial progress on Cloud
                 try:
                     partial = _safe_concat_price_frames(all_frames)
-                    if os.path.exists(PRICES_PARQUET):
+                    if os.path.exists(PRICES_PARQUET) and use_disk_cache:
                         base = pd.read_parquet(PRICES_PARQUET)
                         partial = base.combine_first(partial).combine_first(partial)
                     partial.to_parquet(PRICES_PARQUET)
@@ -488,7 +490,7 @@ def download_prices(
                     # Progressive cache write for partial progress on Cloud
                     try:
                         partial = _safe_concat_price_frames(all_frames)
-                        if os.path.exists(PRICES_PARQUET):
+                        if os.path.exists(PRICES_PARQUET) and use_disk_cache:
                             base = pd.read_parquet(PRICES_PARQUET)
                             partial = base.combine_first(partial).combine_first(partial)
                         partial.to_parquet(PRICES_PARQUET)
@@ -502,7 +504,7 @@ def download_prices(
                         # Progressive cache write for partial progress on Cloud
                         try:
                             partial = _safe_concat_price_frames(all_frames)
-                            if os.path.exists(PRICES_PARQUET):
+                            if os.path.exists(PRICES_PARQUET) and use_disk_cache:
                                 base = pd.read_parquet(PRICES_PARQUET)
                                 partial = base.combine_first(partial).combine_first(partial)
                             partial.to_parquet(PRICES_PARQUET)
@@ -524,7 +526,7 @@ def download_prices(
             out = _safe_concat_price_frames([out, stooq_df])
 
     # Merge with existing cache so we don’t lose previously-fetched columns
-    if os.path.exists(PRICES_PARQUET):
+    if os.path.exists(PRICES_PARQUET) and use_disk_cache:
         try:
             base = pd.read_parquet(PRICES_PARQUET)
             out = base.combine_first(out).combine_first(out)
