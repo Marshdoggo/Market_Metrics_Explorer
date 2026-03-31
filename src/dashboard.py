@@ -53,6 +53,7 @@ except Exception:
     import json
     import requests
     from io import BytesIO
+    from urllib.parse import urlencode
 
     MANIFEST_URL = os.environ.get(
         "MKTME_MANIFEST_URL",
@@ -66,7 +67,10 @@ except Exception:
         return json.loads(r.text)
 
     @st.cache_data(ttl=60*60)
-    def _load_parquet_http(url: str) -> pd.DataFrame:
+    def _load_parquet_http(url: str, cache_key: str) -> pd.DataFrame:
+        if cache_key:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}{urlencode({'v': cache_key})}"
         r = requests.get(url, timeout=60)
         r.raise_for_status()
         df = pd.read_parquet(BytesIO(r.content), engine="pyarrow")
@@ -79,7 +83,8 @@ except Exception:
         if "universes" not in m or universe not in m["universes"]:
             raise RuntimeError(f"Universe '{universe}' not present in manifest at {MANIFEST_URL}")
         url = m["universes"][universe]["parquet_url"]
-        return _load_parquet_http(url)
+        cache_key = str(m.get("generated_at") or "")
+        return _load_parquet_http(url, cache_key=cache_key)
 # -------------------------------------------------------------------------------
 
 
