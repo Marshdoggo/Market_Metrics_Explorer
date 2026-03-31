@@ -207,6 +207,9 @@ def _download_chunk_multi(tickers: List[str], start=None, end=None) -> Tuple[pd.
     if not tickers:
         return pd.DataFrame(), failed
 
+    frames = []
+    missing = list(tickers)
+
     # Multi try
     try:
         df = yf.download(
@@ -218,36 +221,54 @@ def _download_chunk_multi(tickers: List[str], start=None, end=None) -> Tuple[pd.
             threads=False
         )
         # yfinance multi-format normalization to wide 1-col (Close) if needed
-        frames = []
         for sym in tickers:
             try:
                 sub = df[sym] if isinstance(df.columns, pd.MultiIndex) else df
                 # prefer 'Adj Close' then 'Close'
                 col = "Adj Close" if "Adj Close" in sub.columns else "Close" if "Close" in sub.columns else None
                 if col is None:
-                    failed.append(sym); continue
+                    failed.append(sym)
+                    continue
                 series = sub[col].rename(sym)
-                frames.append(series.to_frame())
+                one = series.to_frame().dropna(how="all")
+                if one.empty:
+                    failed.append(sym)
+                    continue
+                frames.append(one)
             except Exception:
                 failed.append(sym)
-        return _safe_concat_price_frames(frames), failed
     except Exception as e:
         _log(f"[fetch_data] multi-chunk error ({len(tickers)}): {e!r}")
-        # fall back to per-ticker below
+        failed = list(tickers)
 
-    # Per ticker fallback for the whole chunk
-    frames = []
-    for sym in tickers:
+    out = _safe_concat_price_frames(frames)
+    if not out.empty:
+        have = set(out.columns)
+        missing = [sym for sym in tickers if sym not in have]
+    else:
+        missing = list(dict.fromkeys(failed or tickers))
+
+    # Per ticker fallback for anything missing from the bulk response.
+    for sym in missing:
         try:
             t = yf.Ticker(sym)
-            hist = t.history(start=start, end=end, auto_adjust=True)
+            history_kwargs = {"auto_adjust": True}
+            if start is None and end is None:
+                # yfinance defaults Ticker.history() to a short window; ask for full history.
+                history_kwargs["period"] = "max"
+            else:
+                history_kwargs["start"] = start
+                history_kwargs["end"] = end
+            hist = t.history(**history_kwargs)
             if hist is None or hist.empty:
-                failed.append(sym); continue
+                failed.append(sym)
+                continue
             col = "Close" if "Close" in hist.columns else None
             if col is None:
-                failed.append(sym); continue
+                failed.append(sym)
+                continue
             frames.append(hist[col].rename(sym).to_frame())
-        except Exception as e:
+        except Exception:
             failed.append(sym)
     return _safe_concat_price_frames(frames), failed
 def _download_stooq(symbols: List[str], start=None, end=None) -> pd.DataFrame:

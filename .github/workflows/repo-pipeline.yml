@@ -5,6 +5,10 @@ on:
     - cron: "15 2 * * 1-5"
   workflow_dispatch:
 
+concurrency:
+  group: repo-pipeline-main
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -73,5 +77,13 @@ jobs:
             echo "No status changes to commit."
           else
             git commit -m "chore: update pipeline status"
-            git push
+            if ! git pull --rebase origin main; then
+              echo "Status rebase failed after publish; leaving workflow green because artifacts already published."
+              git rebase --abort || true
+              exit 0
+            fi
+            if ! git push origin HEAD:main; then
+              echo "Status push lost a race to a newer main commit; skipping status push for this run."
+              exit 0
+            fi
           fi
