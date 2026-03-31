@@ -28,6 +28,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 PRICES_PARQUET = os.path.join(DATA_DIR, "prices.parquet")
 FX_YF_PARQUET  = os.path.join(DATA_DIR, "fx_yf.parquet")
+SOURCE_CANARY_SYMBOLS = ["SPY", "AAPL", "MSFT"]
 
 # NEW: allow publisher to force refresh instead of using cache
 FORCE_REFRESH = os.getenv("MKTME_FORCE_REFRESH", "").lower() in ("1", "true", "yes")
@@ -309,6 +310,14 @@ def _download_stooq(symbols: List[str], start=None, end=None) -> pd.DataFrame:
     return out
 
 
+def _probe_live_equity_sources() -> tuple[pd.DataFrame, pd.DataFrame]:
+    end = pd.Timestamp.utcnow().normalize().tz_localize(None)
+    start = end - pd.Timedelta(days=14)
+    yahoo_df, _ = _download_chunk_multi(SOURCE_CANARY_SYMBOLS, start=start, end=end)
+    stooq_df = _download_stooq(SOURCE_CANARY_SYMBOLS, start=start, end=end)
+    return yahoo_df, stooq_df
+
+
 def download_prices(
     symbols: Iterable[str],
     start: Optional[pd.Timestamp]=None,
@@ -346,6 +355,14 @@ def download_prices(
     # Apply environment-driven defaults
     if prefer_stooq is None:
         prefer_stooq = PREFER_STOOQ_DEFAULT
+
+    if force_refresh and not prefer_stooq:
+        yahoo_probe, stooq_probe = _probe_live_equity_sources()
+        if yahoo_probe.empty and stooq_probe.empty:
+            raise RuntimeError(
+                "Live equity sources are unavailable from this environment. "
+                f"Yahoo and Stooq both returned no data for canary symbols {SOURCE_CANARY_SYMBOLS}."
+            )
 
     # Optionally cap number of symbols to reduce rate-limit risk on Cloud
     if MAX_SYMBOLS_DEFAULT > 0 and len(symbols) > MAX_SYMBOLS_DEFAULT:
