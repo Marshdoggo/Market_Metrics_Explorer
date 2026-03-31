@@ -104,6 +104,59 @@ def _write_prices_parquet(data_repo: Path, universe: str, prices: pd.DataFrame) 
     return rel_path, rel_path
 
 
+def _latest_index_date(entries: list[dict[str, Any]]) -> str | None:
+    dated: list[tuple[pd.Timestamp, str]] = []
+    for entry in entries or []:
+        raw = entry.get("date")
+        ts = pd.to_datetime(raw, errors="coerce")
+        if pd.isna(ts):
+            continue
+        dated.append((ts, ts.date().isoformat()))
+    if not dated:
+        return None
+    dated.sort(key=lambda item: item[0], reverse=True)
+    return dated[0][1]
+
+
+def _sort_report_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _sort_key(entry: dict[str, Any]) -> tuple[int, pd.Timestamp]:
+        ts = pd.to_datetime(entry.get("date"), errors="coerce")
+        if pd.isna(ts):
+            return (1, pd.Timestamp.min)
+        return (0, ts)
+
+    return sorted(entries or [], key=_sort_key, reverse=True)
+
+
+def _assert_not_stale_publish(*, data_repo: Path, universe: str, prices: pd.DataFrame) -> None:
+    if os.environ.get("MKTME_ALLOW_STALE_PUBLISH", "").lower() in {"1", "true", "yes"}:
+        return
+
+    existing_path = data_repo / universe / "prices.parquet"
+    if not existing_path.exists():
+        return
+
+    fetched_max = pd.to_datetime(prices.index, errors="coerce").max()
+    if pd.isna(fetched_max):
+        return
+
+    try:
+        existing = pd.read_parquet(existing_path)
+    except Exception:
+        return
+
+    existing_max = pd.to_datetime(existing.index, errors="coerce").max()
+    if pd.isna(existing_max):
+        return
+
+    if fetched_max < existing_max:
+        raise RuntimeError(
+            f"Refusing to publish stale {universe} prices: fetched max date "
+            f"{fetched_max.date().isoformat()} is older than existing published max date "
+            f"{existing_max.date().isoformat()}. Set MKTME_ALLOW_STALE_PUBLISH=1 to override."
+        )
+
+
 def _write_report_artifacts(
     *,
     data_repo: Path,
@@ -162,7 +215,7 @@ def _write_report_artifacts(
         "facts": f"reports/{universe}/{asof_date}.facts.json",
     }
     existing = [e for e in index["universes"][universe] if e.get("date") != asof_date]
-    index["universes"][universe] = [entry] + existing
+    index["universes"][universe] = _sort_report_entries([entry] + existing)
     index["universes"][universe] = index["universes"][universe][:14]
     index_path.write_text(json.dumps(index, indent=2), encoding="utf-8")
     return asof_date, {
@@ -217,6 +270,7 @@ def run_publish(
             )
             if prices.empty:
                 raise RuntimeError(f"No price data available for universe '{universe}'")
+            _assert_not_stale_publish(data_repo=data_repo, universe=universe, prices=prices)
 
             metrics_df = _build_metrics(prices, tickers_df, lookback=lookback)
             metrics_df["AsOfDate"] = pd.to_datetime(prices.index.max()).date().isoformat()
@@ -248,6 +302,11 @@ def run_publish(
 
         manifest = _write_manifest(data_repo, rel_paths, github_user=github_user)
         reports_index = json.loads((data_repo / "reports" / "index.json").read_text(encoding="utf-8"))
+        report_universes = reports_index.get("universes") or {}
+        for universe, entries in report_universes.items():
+            latest_date = _latest_index_date(entries)
+            if latest_date:
+                set_status(f"legacy.latest_report_date.{universe}", latest_date)
         set_status("pipeline.last_finished_at", utc_now_iso())
         set_status("pipeline.last_success_at", utc_now_iso())
         set_status("pipeline.summary", "Legacy artifact publish completed successfully from the main repo.")

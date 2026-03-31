@@ -729,6 +729,16 @@ DEFAULT_REPORTS_INDEX = (
 REPORTS_INDEX_URL = os.environ.get("MKTME_REPORTS_INDEX_URL", DEFAULT_REPORTS_INDEX)
 DEFAULT_REPORTS_BASE_URL = "https://raw.githubusercontent.com/marshdoggo/mktme-data/main"
 
+
+def _sorted_report_entries(entries):
+    def _sort_key(entry):
+        ts = pd.to_datetime(entry.get("date"), errors="coerce")
+        if pd.isna(ts):
+            return (1, pd.Timestamp.min)
+        return (0, ts)
+
+    return sorted(entries or [], key=_sort_key, reverse=True)
+
 @st.cache_data(ttl=5*60)
 def _load_reports_index(url: str, cache_key: str) -> dict:
     r = requests.get(url, timeout=30)
@@ -775,6 +785,7 @@ if (idx is None or not isinstance(idx, dict) or "universes" not in idx) and not 
 else:
     uni_map = idx.get("universes", {}) if isinstance(idx, dict) else {}
     entries = uni_map.get(universe, []) if isinstance(uni_map, dict) else []
+    entries = _sorted_report_entries(entries)
 
     # Controls
     c1, c2, c3 = st.columns([2, 1, 1])
@@ -793,7 +804,7 @@ else:
         )
 
     if sqlite_report_entries:
-        entries = sqlite_report_entries[: int(show_n)]
+        entries = _sorted_report_entries(sqlite_report_entries)[: int(show_n)]
 
     if not entries:
         st.info(
@@ -801,6 +812,14 @@ else:
             "Run the publisher workflow to generate the first report."
         )
     else:
+        newest_report_ts = pd.to_datetime(entries[0].get("date"), errors="coerce")
+        if not pd.isna(newest_report_ts) and newest_report_ts.date() > max_day:
+            st.warning(
+                f"Published reports are newer than the dataset loaded into the charts "
+                f"({newest_report_ts.date().isoformat()} vs {max_day.isoformat()}). "
+                "That usually means the parquet publish has lagged or regressed."
+            )
+
         # base_url can be provided by the publisher; otherwise derive from index URL.
         base_url = idx.get("base_url") if isinstance(idx, dict) else None
         if not base_url:
