@@ -73,7 +73,7 @@ def _load_or_fetch_prices(
     tickers = tickers_df["Ticker"].astype(str).tolist()
     if universe == "fx":
         asof = pd.Timestamp.now(tz="UTC").normalize().tz_localize(None)
-        return _to_naive_dt_index(
+        fresh = _to_naive_dt_index(
             download_prices_fx_window(
                 tickers,
                 lookback_trading_days=lookback,
@@ -81,7 +81,17 @@ def _load_or_fetch_prices(
                 force_refresh=force_refresh,
             )
         )
-    return _to_naive_dt_index(download_prices(tickers, force_refresh=force_refresh))
+    else:
+        fresh = _to_naive_dt_index(download_prices(tickers, force_refresh=force_refresh))
+
+    if existing_path.exists() and not fresh.empty:
+        try:
+            existing = _to_naive_dt_index(pd.read_parquet(existing_path))
+            # Keep freshly fetched values where available, but backfill symbols/rows the provider missed.
+            fresh = fresh.combine_first(existing)
+        except Exception:
+            pass
+    return fresh
 
 
 def _build_metrics(prices: pd.DataFrame, tickers_df: pd.DataFrame, lookback: int) -> pd.DataFrame:

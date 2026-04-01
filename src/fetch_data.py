@@ -430,6 +430,7 @@ def _download_twelvedata(symbols: List[str], start=None, end=None) -> pd.DataFra
     frames: list[pd.DataFrame] = []
     session = requests.Session()
     chunks = _chunk(symbols, batch_size)
+    failed_symbols: list[str] = []
 
     for i, chunk in enumerate(chunks, 1):
         params = {
@@ -452,36 +453,38 @@ def _download_twelvedata(symbols: List[str], start=None, end=None) -> pd.DataFra
             raise RuntimeError(f"Twelve Data error: {payload.get('message') or payload}")
 
         batch_frames: list[pd.DataFrame] = []
-        batch_errors: list[str] = []
+        batch_missing: list[str] = []
         for sym in chunk:
             key = _twelvedata_symbol(sym)
             item = payload.get(key)
             if not isinstance(item, dict):
-                batch_errors.append(f"{sym}: missing batch payload")
+                batch_missing.append(sym)
                 continue
             if item.get("status") == "error":
-                batch_errors.append(f"{sym}: {item.get('message') or 'unknown error'}")
+                batch_missing.append(sym)
                 continue
             values = item.get("values") or []
             if not values:
-                batch_errors.append(f"{sym}: no values returned")
+                batch_missing.append(sym)
                 continue
             one = pd.DataFrame(values)
             if "close" not in one.columns or "datetime" not in one.columns:
-                batch_errors.append(f"{sym}: malformed response")
+                batch_missing.append(sym)
                 continue
             one["datetime"] = pd.to_datetime(one["datetime"], errors="coerce")
             one["close"] = pd.to_numeric(one["close"], errors="coerce")
             one = one.dropna(subset=["datetime", "close"]).set_index("datetime")[["close"]]
             one.columns = [sym]
             if one.empty:
-                batch_errors.append(f"{sym}: no usable rows after parsing")
+                batch_missing.append(sym)
                 continue
             batch_frames.append(one)
 
-        if batch_errors:
-            raise RuntimeError(
-                "Twelve Data batch returned errors: " + "; ".join(batch_errors[:10])
+        if batch_missing:
+            failed_symbols.extend(batch_missing)
+            _log(
+                f"[fetch_data] Twelve Data missing {len(batch_missing)} symbols in batch {i}: "
+                f"{batch_missing[:10]}{' …' if len(batch_missing) > 10 else ''}"
             )
 
         frames.extend(batch_frames)
@@ -490,7 +493,13 @@ def _download_twelvedata(symbols: List[str], start=None, end=None) -> pd.DataFra
             sleep_s = 60.0 * (len(chunk) / float(TWELVEDATA_PER_MINUTE))
             time.sleep(sleep_s)
 
-    return _safe_concat_price_frames(frames)
+    out = _safe_concat_price_frames(frames)
+    if failed_symbols:
+        _log(
+            f"[fetch_data] Twelve Data missing symbols overall ({len(set(failed_symbols))}): "
+            f"{sorted(set(failed_symbols))[:30]}{' …' if len(set(failed_symbols)) > 30 else ''}"
+        )
+    return out
 
 
 def _probe_live_equity_sources() -> tuple[pd.DataFrame, pd.DataFrame]:
