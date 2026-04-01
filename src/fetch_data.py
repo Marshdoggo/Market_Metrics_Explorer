@@ -409,6 +409,9 @@ def _twelvedata_symbol(symbol: str) -> str:
     if len(s) == 6 and "/" not in s and s.isalpha():
         # EURUSD -> EUR/USD for FX
         return f"{s[:3]}/{s[3:]}"
+    if "-" in s:
+        # Twelve Data uses dot-class syntax for share classes (e.g. BRK.B, BF.B).
+        return s.replace("-", ".")
     return s
 
 
