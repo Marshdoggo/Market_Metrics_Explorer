@@ -71,8 +71,20 @@ def _safe_concat_price_frames(frames: List[pd.DataFrame]) -> pd.DataFrame:
     frames = [f for f in frames if isinstance(f, pd.DataFrame) and not f.empty]
     if not frames:
         return pd.DataFrame()
+    normalized = []
+    for f in frames:
+        one = f.copy()
+        one.index = pd.to_datetime(one.index, errors="coerce")
+        one = one[~one.index.isna()]
+        if one.empty:
+            continue
+        if not one.index.is_unique:
+            one = one.groupby(level=0).last()
+        normalized.append(one.sort_index())
+    if not normalized:
+        return pd.DataFrame()
     # frames from yfinance are wide with one column per symbol
-    df = pd.concat(frames, axis=1)
+    df = pd.concat(normalized, axis=1)
     # ensure DateTimeIndex
     df.index = pd.to_datetime(df.index, errors="coerce")
     df = df[~df.index.isna()]
@@ -474,6 +486,8 @@ def _download_twelvedata(symbols: List[str], start=None, end=None) -> pd.DataFra
             one["datetime"] = pd.to_datetime(one["datetime"], errors="coerce")
             one["close"] = pd.to_numeric(one["close"], errors="coerce")
             one = one.dropna(subset=["datetime", "close"]).set_index("datetime")[["close"]]
+            if not one.index.is_unique:
+                one = one.groupby(level=0).last()
             one.columns = [sym]
             if one.empty:
                 batch_missing.append(sym)
