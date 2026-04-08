@@ -65,6 +65,7 @@ def _load_or_fetch_prices(
     lookback: int,
     force_refresh: bool,
     use_existing_parquet: bool,
+    prefetched_prices: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     existing_path = data_repo / universe / "prices.parquet"
     if use_existing_parquet and existing_path.exists():
@@ -81,6 +82,9 @@ def _load_or_fetch_prices(
                 force_refresh=force_refresh,
             )
         )
+    elif prefetched_prices is not None:
+        available = [ticker for ticker in tickers if ticker in prefetched_prices.columns]
+        fresh = _to_naive_dt_index(prefetched_prices[available]) if available else pd.DataFrame()
     else:
         fresh = _to_naive_dt_index(download_prices(tickers, force_refresh=force_refresh))
 
@@ -268,8 +272,22 @@ def run_publish(
 
     try:
         data_repo.mkdir(parents=True, exist_ok=True)
+        ticker_frames = {universe: _ticker_frame(universe) for universe in universes}
+        prefetched_equity_prices: pd.DataFrame | None = None
+        equity_tickers: list[str] = []
         for universe in universes:
-            tickers_df = _ticker_frame(universe)
+            if universe == "fx":
+                continue
+            for ticker in ticker_frames[universe]["Ticker"].astype(str).tolist():
+                if ticker not in equity_tickers:
+                    equity_tickers.append(ticker)
+        if equity_tickers and not use_existing_parquet:
+            prefetched_equity_prices = _to_naive_dt_index(
+                download_prices(equity_tickers, force_refresh=force_refresh)
+            )
+
+        for universe in universes:
+            tickers_df = ticker_frames[universe]
             prices = _load_or_fetch_prices(
                 data_repo=data_repo,
                 universe=universe,
@@ -277,6 +295,7 @@ def run_publish(
                 lookback=lookback,
                 force_refresh=force_refresh,
                 use_existing_parquet=use_existing_parquet,
+                prefetched_prices=prefetched_equity_prices,
             )
             if prices.empty:
                 raise RuntimeError(f"No price data available for universe '{universe}'")

@@ -1,6 +1,7 @@
 # src/fetch_data.py
 from __future__ import annotations
 import os, io, time, json, math, textwrap
+from collections import deque
 from typing import List, Iterable, Tuple, Optional, Dict
 
 
@@ -30,6 +31,10 @@ TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 TWELVEDATA_DAILY_LIMIT = int(os.getenv("TWELVEDATA_DAILY_LIMIT", "800") or 800)
 TWELVEDATA_PER_MINUTE = int(os.getenv("TWELVEDATA_PER_MINUTE", "8") or 8)
 TWELVEDATA_OUTPUTSIZE = int(os.getenv("TWELVEDATA_OUTPUTSIZE", "3000") or 3000)
+TWELVEDATA_RATE_LIMIT_BUFFER_SECONDS = float(
+    os.getenv("TWELVEDATA_RATE_LIMIT_BUFFER_SECONDS", "2") or 2
+)
+TWELVEDATA_MINUTE_RETRY_LIMIT = int(os.getenv("TWELVEDATA_MINUTE_RETRY_LIMIT", "2") or 2)
 MAX_SYMBOLS_DEFAULT = int(os.getenv("MKTME_MAX_SYMBOLS", "0") or 0)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
@@ -38,6 +43,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 PRICES_PARQUET = os.path.join(DATA_DIR, "prices.parquet")
 FX_YF_PARQUET  = os.path.join(DATA_DIR, "fx_yf.parquet")
 SOURCE_CANARY_SYMBOLS = ["SPY", "AAPL", "MSFT"]
+_TWELVEDATA_CREDIT_HISTORY: deque[tuple[float, int]] = deque()
 
 # NEW: allow publisher to force refresh instead of using cache
 FORCE_REFRESH = os.getenv("MKTME_FORCE_REFRESH", "").lower() in ("1", "true", "yes")
@@ -427,6 +433,59 @@ def _twelvedata_symbol(symbol: str) -> str:
     return s
 
 
+def _prune_twelvedata_credit_history(now: Optional[float]=None) -> None:
+    if now is None:
+        now = time.monotonic()
+    while _TWELVEDATA_CREDIT_HISTORY and now - _TWELVEDATA_CREDIT_HISTORY[0][0] >= 60.0:
+        _TWELVEDATA_CREDIT_HISTORY.popleft()
+
+
+def _seconds_until_twelvedata_capacity(required_credits: int, now: Optional[float]=None) -> float:
+    if TWELVEDATA_PER_MINUTE <= 0:
+        return 0.0
+    if required_credits > TWELVEDATA_PER_MINUTE:
+        raise RuntimeError(
+            f"Twelve Data request needs {required_credits} credits but "
+            f"TWELVEDATA_PER_MINUTE={TWELVEDATA_PER_MINUTE}."
+        )
+
+    if now is None:
+        now = time.monotonic()
+    _prune_twelvedata_credit_history(now)
+
+    used = sum(credits for _, credits in _TWELVEDATA_CREDIT_HISTORY)
+    if used + required_credits <= TWELVEDATA_PER_MINUTE:
+        return 0.0
+
+    reclaimed = 0
+    for ts, credits in _TWELVEDATA_CREDIT_HISTORY:
+        reclaimed += credits
+        if used - reclaimed + required_credits <= TWELVEDATA_PER_MINUTE:
+            return max(0.0, 60.0 - (now - ts) + TWELVEDATA_RATE_LIMIT_BUFFER_SECONDS)
+    return 60.0 + TWELVEDATA_RATE_LIMIT_BUFFER_SECONDS
+
+
+def _reserve_twelvedata_credits(required_credits: int) -> None:
+    if TWELVEDATA_PER_MINUTE <= 0:
+        return
+    while True:
+        now = time.monotonic()
+        wait_s = _seconds_until_twelvedata_capacity(required_credits, now=now)
+        if wait_s <= 0:
+            _TWELVEDATA_CREDIT_HISTORY.append((now, required_credits))
+            return
+        _log(
+            f"[fetch_data] Twelve Data waiting {wait_s:.1f}s for minute credits "
+            f"before requesting {required_credits} symbols"
+        )
+        time.sleep(wait_s)
+
+
+def _is_twelvedata_minute_limit_message(message: object) -> bool:
+    text = str(message or "").lower()
+    return "current minute" in text and "api credits" in text
+
+
 def _download_twelvedata(symbols: List[str], start=None, end=None) -> pd.DataFrame:
     if not TWELVEDATA_API_KEY:
         raise RuntimeError(
@@ -457,12 +516,25 @@ def _download_twelvedata(symbols: List[str], start=None, end=None) -> pd.DataFra
         if end is not None:
             params["end_date"] = pd.Timestamp(end).strftime("%Y-%m-%d")
 
-        resp = session.get("https://api.twelvedata.com/time_series", params=params, timeout=90)
-        resp.raise_for_status()
-        payload = resp.json()
+        for attempt in range(TWELVEDATA_MINUTE_RETRY_LIMIT + 1):
+            _reserve_twelvedata_credits(len(chunk))
+            resp = session.get("https://api.twelvedata.com/time_series", params=params, timeout=90)
+            resp.raise_for_status()
+            payload = resp.json()
 
-        if isinstance(payload, dict) and payload.get("status") == "error":
-            raise RuntimeError(f"Twelve Data error: {payload.get('message') or payload}")
+            if not (isinstance(payload, dict) and payload.get("status") == "error"):
+                break
+
+            message = payload.get("message") or payload
+            if attempt >= TWELVEDATA_MINUTE_RETRY_LIMIT or not _is_twelvedata_minute_limit_message(message):
+                raise RuntimeError(f"Twelve Data error: {message}")
+
+            wait_s = _seconds_until_twelvedata_capacity(1) or (60.0 + TWELVEDATA_RATE_LIMIT_BUFFER_SECONDS)
+            _log(
+                f"[fetch_data] Twelve Data minute limit hit on batch {i}/{len(chunks)}; "
+                f"retrying in {wait_s:.1f}s"
+            )
+            time.sleep(wait_s)
 
         batch_frames: list[pd.DataFrame] = []
         batch_missing: list[str] = []
@@ -503,9 +575,6 @@ def _download_twelvedata(symbols: List[str], start=None, end=None) -> pd.DataFra
 
         frames.extend(batch_frames)
         _log(f"[fetch_data] Twelve Data batch {i}/{len(chunks)}: {len(batch_frames)} symbols")
-        if i < len(chunks) and TWELVEDATA_PER_MINUTE > 0:
-            sleep_s = 60.0 * (len(chunk) / float(TWELVEDATA_PER_MINUTE))
-            time.sleep(sleep_s)
 
     out = _safe_concat_price_frames(frames)
     if failed_symbols:
