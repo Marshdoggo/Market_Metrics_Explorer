@@ -57,6 +57,21 @@ def _ticker_frame(universe: str) -> pd.DataFrame:
     return get_universe(universe, force_refresh=False)
 
 
+def _normalize_source(raw: str | None, fallback: str) -> str:
+    value = (raw or "").strip().lower()
+    return value or fallback
+
+
+def _source_map_from_args(args: argparse.Namespace) -> dict[str, str]:
+    fallback = _normalize_source(os.environ.get("MKTME_EQUITY_SOURCE"), "auto")
+    return {
+        "sp500": _normalize_source(args.source_sp500, fallback),
+        "nasdaq100": _normalize_source(args.source_nasdaq100, fallback),
+        "dow30": _normalize_source(args.source_dow30, fallback),
+        "fx": _normalize_source(args.source_fx, fallback),
+    }
+
+
 def _load_or_fetch_prices(
     *,
     data_repo: Path,
@@ -66,6 +81,7 @@ def _load_or_fetch_prices(
     force_refresh: bool,
     use_existing_parquet: bool,
     prefetched_prices: pd.DataFrame | None = None,
+    equity_source: str = "auto",
 ) -> pd.DataFrame:
     existing_path = data_repo / universe / "prices.parquet"
     if use_existing_parquet and existing_path.exists():
@@ -80,13 +96,20 @@ def _load_or_fetch_prices(
                 lookback_trading_days=lookback,
                 asof=asof,
                 force_refresh=force_refresh,
+                equity_source=equity_source,
             )
         )
     elif prefetched_prices is not None:
         available = [ticker for ticker in tickers if ticker in prefetched_prices.columns]
         fresh = _to_naive_dt_index(prefetched_prices[available]) if available else pd.DataFrame()
     else:
-        fresh = _to_naive_dt_index(download_prices(tickers, force_refresh=force_refresh))
+        fresh = _to_naive_dt_index(
+            download_prices(
+                tickers,
+                force_refresh=force_refresh,
+                equity_source=equity_source,
+            )
+        )
 
     if existing_path.exists() and not fresh.empty:
         try:
@@ -255,6 +278,7 @@ def run_publish(
     *,
     data_repo: Path,
     universes: list[str],
+    source_by_universe: dict[str, str],
     lookback: int,
     force_refresh: bool,
     trigger_type: str,
@@ -273,21 +297,31 @@ def run_publish(
     try:
         data_repo.mkdir(parents=True, exist_ok=True)
         ticker_frames = {universe: _ticker_frame(universe) for universe in universes}
-        prefetched_equity_prices: pd.DataFrame | None = None
-        equity_tickers: list[str] = []
+        prefetched_equity_prices: dict[str, pd.DataFrame] = {}
+        grouped_tickers: dict[str, list[str]] = {}
         for universe in universes:
             if universe == "fx":
                 continue
+            source = source_by_universe.get(universe, "auto")
+            grouped_tickers.setdefault(source, [])
             for ticker in ticker_frames[universe]["Ticker"].astype(str).tolist():
-                if ticker not in equity_tickers:
-                    equity_tickers.append(ticker)
-        if equity_tickers and not use_existing_parquet:
-            prefetched_equity_prices = _to_naive_dt_index(
-                download_prices(equity_tickers, force_refresh=force_refresh)
-            )
+                if ticker not in grouped_tickers[source]:
+                    grouped_tickers[source].append(ticker)
+        if not use_existing_parquet:
+            for source, equity_tickers in grouped_tickers.items():
+                if not equity_tickers:
+                    continue
+                prefetched_equity_prices[source] = _to_naive_dt_index(
+                    download_prices(
+                        equity_tickers,
+                        force_refresh=force_refresh,
+                        equity_source=source,
+                    )
+                )
 
         for universe in universes:
             tickers_df = ticker_frames[universe]
+            universe_source = source_by_universe.get(universe, "auto")
             prices = _load_or_fetch_prices(
                 data_repo=data_repo,
                 universe=universe,
@@ -295,7 +329,8 @@ def run_publish(
                 lookback=lookback,
                 force_refresh=force_refresh,
                 use_existing_parquet=use_existing_parquet,
-                prefetched_prices=prefetched_equity_prices,
+                prefetched_prices=prefetched_equity_prices.get(universe_source),
+                equity_source=universe_source,
             )
             if prices.empty:
                 raise RuntimeError(f"No price data available for universe '{universe}'")
@@ -347,6 +382,7 @@ def run_publish(
 
         details = {
             "published_universes": universes,
+            "source_by_universe": source_by_universe,
             "latest_report_dates": asof_dates,
             "manifest_generated_at": manifest.get("generated_at"),
             "data_repo": str(data_repo),
@@ -373,11 +409,16 @@ def main() -> None:
     parser.add_argument("--force-refresh", action="store_true", default=os.environ.get("MKTME_FORCE_REFRESH", "").lower() in {"1", "true", "yes"})
     parser.add_argument("--use-existing-parquet", action="store_true")
     parser.add_argument("--universes", nargs="+", default=["sp500"])
+    parser.add_argument("--source-sp500", default=os.environ.get("MKTME_SOURCE_SP500", ""))
+    parser.add_argument("--source-nasdaq100", default=os.environ.get("MKTME_SOURCE_NASDAQ100", ""))
+    parser.add_argument("--source-dow30", default=os.environ.get("MKTME_SOURCE_DOW30", ""))
+    parser.add_argument("--source-fx", default=os.environ.get("MKTME_SOURCE_FX", ""))
     args = parser.parse_args()
 
     run_publish(
         data_repo=Path(args.data_repo).expanduser(),
         universes=[u.lower() for u in args.universes],
+        source_by_universe=_source_map_from_args(args),
         lookback=int(args.lookback),
         force_refresh=bool(args.force_refresh),
         trigger_type=args.trigger_type,

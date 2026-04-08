@@ -593,6 +593,10 @@ def _probe_live_equity_sources() -> tuple[pd.DataFrame, pd.DataFrame]:
     return yahoo_df, stooq_df
 
 
+def _resolve_equity_source(equity_source: Optional[str]=None) -> str:
+    return (equity_source or EQUITY_SOURCE_DEFAULT).strip().lower() or "auto"
+
+
 def download_prices(
     symbols: Iterable[str],
     start: Optional[pd.Timestamp]=None,
@@ -602,6 +606,7 @@ def download_prices(
     max_retries: int=3,
     backoff_base: float=1.0,
     prefer_stooq: Optional[bool]=None,
+    equity_source: Optional[str]=None,
 ) -> pd.DataFrame:
     """
     Wide DataFrame of prices (auto-adjusted close), columns=tickers.
@@ -627,7 +632,7 @@ def download_prices(
     start = _to_naive_ts(start)
     end   = _to_naive_ts(end)
 
-    equity_source = EQUITY_SOURCE_DEFAULT
+    equity_source = _resolve_equity_source(equity_source)
 
     # Apply environment-driven defaults
     if prefer_stooq is None:
@@ -880,12 +885,14 @@ def download_prices_fx_window(
     lookback_trading_days: int,
     asof: pd.Timestamp,
     force_refresh: bool=False,
-    chunk_size: int=25
+    chunk_size: int=25,
+    equity_source: Optional[str]=None,
 ) -> pd.DataFrame:
     """
     Windowed FX fetch using yfinance (close). Returns wide DF columns=pairs.
     """
-    if EQUITY_SOURCE_DEFAULT == "twelvedata":
+    resolved_source = _resolve_equity_source(equity_source)
+    if resolved_source == "twelvedata":
         end = pd.Timestamp(asof).normalize()
         from pandas.tseries.offsets import BDay
         start = (end - BDay(int(lookback_trading_days))).normalize()
@@ -897,7 +904,14 @@ def download_prices_fx_window(
     from pandas.tseries.offsets import BDay
     start = (end - BDay(int(lookback_trading_days))).normalize()
 
-    df = download_prices(yf_syms, start=start, end=end, force_refresh=force_refresh, chunk_size=chunk_size)
+    df = download_prices(
+        yf_syms,
+        start=start,
+        end=end,
+        force_refresh=force_refresh,
+        chunk_size=chunk_size,
+        equity_source=resolved_source,
+    )
 
     # Map back columns from 'EURUSD=X' -> 'EURUSD'
     colmap = {s: s.replace("=X","") for s in df.columns}

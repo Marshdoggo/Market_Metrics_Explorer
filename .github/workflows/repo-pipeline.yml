@@ -4,6 +4,31 @@ on:
   schedule:
     - cron: "15 2 * * 1-5"
   workflow_dispatch:
+    inputs:
+      universes:
+        description: "Space-separated universes to publish"
+        required: true
+        default: "nasdaq100 dow30 fx"
+      equity_source_default:
+        description: "Default source for universes without an override"
+        required: false
+        default: "auto"
+      source_sp500:
+        description: "Optional source override for sp500"
+        required: false
+        default: "twelvedata"
+      source_nasdaq100:
+        description: "Optional source override for nasdaq100"
+        required: false
+        default: "auto"
+      source_dow30:
+        description: "Optional source override for dow30"
+        required: false
+        default: "auto"
+      source_fx:
+        description: "Optional source override for fx"
+        required: false
+        default: "auto"
 
 concurrency:
   group: repo-pipeline-main
@@ -41,17 +66,31 @@ jobs:
 
       - name: Publish legacy artifacts from the main repo
         env:
-          MKTME_PIPELINE_TRIGGER: schedule
+          MKTME_PIPELINE_TRIGGER: ${{ github.event_name }}
           MKTME_DATA_REPO: ${{ github.workspace }}/mktme_data
           MKTME_GITHUB_USER: marshdoggo
           MKTME_FORCE_REFRESH: "1"
-          MKTME_EQUITY_SOURCE: "twelvedata"
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           TWELVEDATA_DAILY_LIMIT: ${{ vars.TWELVEDATA_DAILY_LIMIT || '800' }}
           TWELVEDATA_PER_MINUTE: ${{ vars.TWELVEDATA_PER_MINUTE || '8' }}
           TWELVEDATA_OUTPUTSIZE: ${{ vars.TWELVEDATA_OUTPUTSIZE || '3000' }}
         run: |
-          python -m pipeline.publish_legacy_artifacts --universes sp500 nasdaq100 dow30 fx
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            export MKTME_EQUITY_SOURCE="${{ inputs.equity_source_default }}"
+            export MKTME_SOURCE_SP500="${{ inputs.source_sp500 }}"
+            export MKTME_SOURCE_NASDAQ100="${{ inputs.source_nasdaq100 }}"
+            export MKTME_SOURCE_DOW30="${{ inputs.source_dow30 }}"
+            export MKTME_SOURCE_FX="${{ inputs.source_fx }}"
+            UNIVERSES="${{ inputs.universes }}"
+          else
+            export MKTME_EQUITY_SOURCE="auto"
+            export MKTME_SOURCE_SP500="twelvedata"
+            export MKTME_SOURCE_NASDAQ100="auto"
+            export MKTME_SOURCE_DOW30="auto"
+            export MKTME_SOURCE_FX="auto"
+            UNIVERSES="nasdaq100 dow30 fx"
+          fi
+          python -m pipeline.publish_legacy_artifacts --universes ${UNIVERSES}
 
       - name: Commit and push mktme-data
         env:
