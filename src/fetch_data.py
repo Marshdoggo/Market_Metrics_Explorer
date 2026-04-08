@@ -893,6 +893,50 @@ def _fx_to_yf_symbol(pair: str) -> str:
     s = str(pair).strip().upper().replace("/", "")
     return f"{s}=X"
 
+
+def _download_yahoo_symbols(
+    symbols: List[str],
+    *,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    chunk_size: int=25,
+    max_retries: int=3,
+    backoff_base: float=1.0,
+) -> pd.DataFrame:
+    all_frames: list[pd.DataFrame] = []
+    all_failed: list[str] = []
+    chunks = _chunk(symbols, chunk_size)
+
+    for i, chunk in enumerate(chunks, 1):
+        attempt = 0
+        chunk_loaded = False
+        while attempt <= max_retries:
+            df, failed = _download_chunk_multi(chunk, start=start, end=end)
+            if not df.empty:
+                all_frames.append(df)
+                all_failed.extend(failed)
+                chunk_loaded = True
+                break
+            attempt += 1
+            if attempt <= max_retries:
+                sleep_s = backoff_base * (2 ** (attempt - 1))
+                _log(
+                    f"[fetch_data] Yahoo-only chunk {i}/{len(chunks)} "
+                    f"retry {attempt} in {sleep_s:.1f}s…"
+                )
+                time.sleep(sleep_s)
+        if not chunk_loaded:
+            all_failed.extend(chunk)
+
+    out = _safe_concat_price_frames(all_frames)
+    missing = sorted(set(symbols) - set(out.columns)) if not out.empty else sorted(set(symbols))
+    if missing:
+        _log(
+            f"[fetch_data] Yahoo-only missing {len(missing)} symbols; "
+            f"examples: {missing[:30]}{' …' if len(missing) > 30 else ''}"
+        )
+    return out
+
 def download_prices_fx_window(
     pairs: List[str],
     lookback_trading_days: int,
@@ -905,26 +949,30 @@ def download_prices_fx_window(
     Windowed FX fetch using yfinance (close). Returns wide DF columns=pairs.
     """
     resolved_source = _resolve_equity_source(equity_source)
-    if resolved_source == "twelvedata":
-        end = pd.Timestamp(asof).normalize()
-        from pandas.tseries.offsets import BDay
-        start = (end - BDay(int(lookback_trading_days))).normalize()
-        return _download_twelvedata(pairs, start=start, end=end)
-
-    yf_syms = [_fx_to_yf_symbol(p) for p in pairs]
     end = pd.Timestamp(asof).normalize()
-    # Use business days as in dashboard:
     from pandas.tseries.offsets import BDay
     start = (end - BDay(int(lookback_trading_days))).normalize()
 
-    df = download_prices(
-        yf_syms,
-        start=start,
-        end=end,
-        force_refresh=force_refresh,
-        chunk_size=chunk_size,
-        equity_source=resolved_source,
-    )
+    if resolved_source == "twelvedata":
+        return _download_twelvedata(pairs, start=start, end=end)
+
+    yf_syms = [_fx_to_yf_symbol(p) for p in pairs]
+    if resolved_source in {"auto", "yahoo"}:
+        df = _download_yahoo_symbols(
+            yf_syms,
+            start=start,
+            end=end,
+            chunk_size=chunk_size,
+        )
+    else:
+        df = download_prices(
+            yf_syms,
+            start=start,
+            end=end,
+            force_refresh=force_refresh,
+            chunk_size=chunk_size,
+            equity_source=resolved_source,
+        )
 
     # Map back columns from 'EURUSD=X' -> 'EURUSD'
     colmap = {s: s.replace("=X","") for s in df.columns}

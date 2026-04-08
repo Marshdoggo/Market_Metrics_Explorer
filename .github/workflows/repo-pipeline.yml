@@ -8,7 +8,7 @@ on:
       universes:
         description: "Space-separated universes to publish"
         required: true
-        default: "nasdaq100 dow30 fx"
+        default: "fx"
       equity_source_default:
         description: "Default source for universes without an override (auto, stooq, yahoo, twelvedata, alphavantage)"
         required: false
@@ -28,7 +28,7 @@ on:
       source_fx:
         description: "Optional source override for fx"
         required: false
-        default: "auto"
+        default: "yahoo"
       use_existing_parquet:
         description: "Reuse checked-out mktme-data parquet files instead of live refresh"
         required: false
