@@ -28,7 +28,7 @@ on:
       source_fx:
         description: "Optional source override for fx"
         required: false
-        default: "yahoo"
+        default: "alphavantage"
       use_existing_parquet:
         description: "Reuse checked-out mktme-data parquet files instead of live refresh"
         required: false
@@ -74,6 +74,9 @@ jobs:
           MKTME_DATA_REPO: ${{ github.workspace }}/mktme_data
           MKTME_GITHUB_USER: marshdoggo
           MKTME_FORCE_REFRESH: "1"
+          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
+          ALPHAVANTAGE_DAILY_LIMIT: ${{ vars.ALPHAVANTAGE_DAILY_LIMIT || '25' }}
+          ALPHAVANTAGE_PER_MINUTE: ${{ vars.ALPHAVANTAGE_PER_MINUTE || '5' }}
           TWELVEDATA_API_KEY: ${{ secrets.TWELVEDATA_API_KEY }}
           TWELVEDATA_DAILY_LIMIT: ${{ vars.TWELVEDATA_DAILY_LIMIT || '800' }}
           TWELVEDATA_PER_MINUTE: ${{ vars.TWELVEDATA_PER_MINUTE || '8' }}

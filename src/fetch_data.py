@@ -421,6 +421,70 @@ def _download_alpha_vantage(symbols: List[str], start=None, end=None) -> pd.Data
     return _safe_concat_price_frames(frames)
 
 
+def _download_alpha_vantage_fx(pairs: List[str], start=None, end=None) -> pd.DataFrame:
+    if not ALPHAVANTAGE_API_KEY:
+        raise RuntimeError(
+            "source_fx=alphavantage but ALPHAVANTAGE_API_KEY is not set."
+        )
+    if len(pairs) > ALPHAVANTAGE_DAILY_LIMIT:
+        raise RuntimeError(
+            "Alpha Vantage free tier cannot refresh this FX universe: "
+            f"{len(pairs)} pairs requested but ALPHAVANTAGE_DAILY_LIMIT={ALPHAVANTAGE_DAILY_LIMIT}."
+        )
+
+    session = requests.Session()
+    sleep_s = 0.0 if ALPHAVANTAGE_PER_MINUTE <= 0 else max(0.0, 60.0 / ALPHAVANTAGE_PER_MINUTE)
+    frames: list[pd.DataFrame] = []
+
+    for idx, pair in enumerate(pairs):
+        normalized = str(pair).strip().upper().replace("/", "")
+        if len(normalized) != 6 or not normalized.isalpha():
+            raise RuntimeError(f"Unsupported FX pair for Alpha Vantage: {pair}")
+        params = {
+            "function": "FX_DAILY",
+            "from_symbol": normalized[:3],
+            "to_symbol": normalized[3:],
+            "apikey": ALPHAVANTAGE_API_KEY,
+            "datatype": "json",
+            "outputsize": "full",
+        }
+        resp = session.get("https://www.alphavantage.co/query", params=params, timeout=60)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        if payload.get("Error Message"):
+            raise RuntimeError(f"Alpha Vantage FX error for {pair}: {payload['Error Message']}")
+        if payload.get("Note"):
+            raise RuntimeError(f"Alpha Vantage FX rate limit response for {pair}: {payload['Note']}")
+        if payload.get("Information"):
+            raise RuntimeError(f"Alpha Vantage FX info response for {pair}: {payload['Information']}")
+
+        series_key = next((key for key in payload.keys() if "Time Series FX" in key), None)
+        if not series_key:
+            raise RuntimeError(f"Alpha Vantage returned no FX time series for {pair}.")
+
+        ts = payload.get(series_key) or {}
+        if not ts:
+            raise RuntimeError(f"Alpha Vantage returned an empty FX time series for {pair}.")
+
+        s = pd.Series({k: float(v["4. close"]) for k, v in ts.items() if "4. close" in v}, name=normalized)
+        one = s.to_frame()
+        one.index = pd.to_datetime(one.index, errors="coerce")
+        one = one[~one.index.isna()].sort_index()
+        if start is not None:
+            one = one[one.index >= pd.Timestamp(start)]
+        if end is not None:
+            one = one[one.index <= pd.Timestamp(end)]
+        if one.empty:
+            raise RuntimeError(f"Alpha Vantage returned no usable FX rows for {pair} after filtering.")
+        frames.append(one)
+
+        if idx < len(pairs) - 1 and sleep_s > 0:
+            time.sleep(sleep_s)
+
+    return _safe_concat_price_frames(frames)
+
+
 def _twelvedata_symbol(symbol: str) -> str:
     s = str(symbol).strip().upper()
     if s.endswith("=X"):
@@ -955,6 +1019,8 @@ def download_prices_fx_window(
 
     if resolved_source == "twelvedata":
         return _download_twelvedata(pairs, start=start, end=end)
+    if resolved_source == "alphavantage":
+        return _download_alpha_vantage_fx(pairs, start=start, end=end)
 
     yf_syms = [_fx_to_yf_symbol(p) for p in pairs]
     if resolved_source in {"auto", "yahoo"}:
