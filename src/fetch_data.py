@@ -35,6 +35,7 @@ TWELVEDATA_RATE_LIMIT_BUFFER_SECONDS = float(
     os.getenv("TWELVEDATA_RATE_LIMIT_BUFFER_SECONDS", "2") or 2
 )
 TWELVEDATA_MINUTE_RETRY_LIMIT = int(os.getenv("TWELVEDATA_MINUTE_RETRY_LIMIT", "2") or 2)
+ALLOW_SOURCE_PROBE_FAILURE = os.getenv("MKTME_ALLOW_SOURCE_PROBE_FAILURE", "1").lower() in ("1", "true", "yes")
 MAX_SYMBOLS_DEFAULT = int(os.getenv("MKTME_MAX_SYMBOLS", "0") or 0)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
@@ -644,13 +645,25 @@ def download_prices(
     if equity_source == "alphavantage":
         return _download_alpha_vantage(symbols, start=start, end=end)
 
+    if equity_source == "stooq":
+        prefer_stooq = True
+    elif equity_source == "yahoo":
+        prefer_stooq = False
+
     if force_refresh and not prefer_stooq:
         yahoo_probe, stooq_probe = _probe_live_equity_sources()
         if yahoo_probe.empty and stooq_probe.empty:
-            raise RuntimeError(
-                "Live equity sources are unavailable from this environment. "
-                f"Yahoo and Stooq both returned no data for canary symbols {SOURCE_CANARY_SYMBOLS}."
+            message = (
+                "Live equity source probe returned no data for canary symbols "
+                f"{SOURCE_CANARY_SYMBOLS}; continuing anyway and letting per-chunk fallbacks decide."
             )
+            if ALLOW_SOURCE_PROBE_FAILURE:
+                _log(f"[fetch_data] {message}")
+            else:
+                raise RuntimeError(
+                    "Live equity sources are unavailable from this environment. "
+                    f"Yahoo and Stooq both returned no data for canary symbols {SOURCE_CANARY_SYMBOLS}."
+                )
 
     # Optionally cap number of symbols to reduce rate-limit risk on Cloud
     if MAX_SYMBOLS_DEFAULT > 0 and len(symbols) > MAX_SYMBOLS_DEFAULT:
