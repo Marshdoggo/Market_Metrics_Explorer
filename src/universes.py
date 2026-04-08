@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os, time, json, pathlib
+from io import StringIO
 import pandas as pd
 import requests
 
@@ -23,7 +24,7 @@ def _read_wiki_constituents(url: str) -> pd.DataFrame:
     resp = requests.get(url, headers=headers, timeout=20)
     resp.raise_for_status()
 
-    tables = pd.read_html(resp.text)
+    tables = pd.read_html(StringIO(resp.text))
     best_df = None
     best_score = -1
 
