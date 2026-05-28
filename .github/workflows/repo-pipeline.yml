@@ -20,11 +20,11 @@ on:
       source_nasdaq100:
         description: "Optional source override for nasdaq100"
         required: false
-        default: "stooq"
+        default: "twelvedata"
       source_dow30:
         description: "Optional source override for dow30"
         required: false
-        default: "stooq"
+        default: "twelvedata"
       source_fx:
         description: "Optional source override for fx"
         required: false
@@ -93,10 +93,10 @@ jobs:
           else
             export MKTME_EQUITY_SOURCE="auto"
             export MKTME_SOURCE_SP500="twelvedata"
-            export MKTME_SOURCE_NASDAQ100="stooq"
-            export MKTME_SOURCE_DOW30="stooq"
+            export MKTME_SOURCE_NASDAQ100="twelvedata"
+            export MKTME_SOURCE_DOW30="twelvedata"
             export MKTME_SOURCE_FX="auto"
-            UNIVERSES="nasdaq100 dow30 fx"
+            UNIVERSES="sp500 nasdaq100 dow30 fx"
             USE_EXISTING_PARQUET="false"
           fi
           EXTRA_ARGS=""
