@@ -26,6 +26,7 @@ from metrics_registry import METRICS
 from metric_docs import METRIC_META, get_pair_guide
 from plot_metrics import scatter_xy
 from universes import get_universe
+from local_pipeline import VALID_SOURCES, local_pipeline_ui_enabled, run_pipeline
 
 
 
@@ -155,6 +156,63 @@ with st.sidebar:
         help='Pick the asset universe to analyze'
     )
     lookback = st.number_input('Lookback (trading days)', min_value=60, max_value=2520, value=252, step=21)
+    if local_pipeline_ui_enabled():
+        with st.expander("Local data pipeline", expanded=False):
+            st.caption("Runs only from this checkout. It is hidden on Streamlit Cloud unless explicitly enabled.")
+            pipeline_universes = st.multiselect(
+                "Universes",
+                ["sp500", "nasdaq100", "dow30", "fx"],
+                default=["sp500", "nasdaq100", "dow30", "fx"],
+                key="local_pipeline_universes",
+            )
+            pipeline_source = st.selectbox(
+                "Data source",
+                VALID_SOURCES,
+                index=VALID_SOURCES.index(os.getenv("MKTME_EQUITY_SOURCE", "auto"))
+                if os.getenv("MKTME_EQUITY_SOURCE", "auto") in VALID_SOURCES
+                else 0,
+                key="local_pipeline_source",
+            )
+            pipeline_force = st.checkbox(
+                "Force live refresh",
+                value=True,
+                help="Bypasses cached fetches and asks the provider layer for fresh data.",
+                key="local_pipeline_force",
+            )
+            pipeline_existing = st.checkbox(
+                "Reuse existing parquet only",
+                value=False,
+                help="Rebuilds reports and manifest from local parquet files without calling data vendors.",
+                key="local_pipeline_existing",
+            )
+            if st.button("Run local pipeline", type="primary", key="run_local_pipeline"):
+                with st.spinner("Running local data pipeline..."):
+                    try:
+                        result = run_pipeline(
+                            universes=pipeline_universes,
+                            lookback=int(lookback),
+                            equity_source=pipeline_source,
+                            force_refresh=bool(pipeline_force),
+                            use_existing_parquet=bool(pipeline_existing),
+                        )
+                    except Exception as exc:
+                        st.error(f"Pipeline launch failed: {type(exc).__name__}: {exc}")
+                    else:
+                        if result.returncode == 0:
+                            st.success("Pipeline completed. Clearing cached app data...")
+                            st.code(" ".join(result.command), language="bash")
+                            if result.stdout.strip():
+                                st.text_area("Pipeline output", result.stdout[-6000:], height=220)
+                            st.cache_data.clear()
+                            st.rerun()
+                        else:
+                            st.error(f"Pipeline failed with exit code {result.returncode}.")
+                            st.code(" ".join(result.command), language="bash")
+                            combined_output = "\n\n".join(
+                                part for part in [result.stdout.strip(), result.stderr.strip()] if part
+                            )
+                            if combined_output:
+                                st.text_area("Pipeline output", combined_output[-10000:], height=260)
     interactive = st.checkbox('Interactive chart (Plotly)', value=True)
     query = st.text_input('Highlight tickers (comma-separated)', value='', placeholder='AAPL, MSFT, NVDA  •  or  EURUSD, USDJPY')
     st.caption('Data by Wikipedia (equities) and local publisher → Parquet (served via GitHub Raw).')

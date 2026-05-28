@@ -112,6 +112,27 @@ def run_probe(trigger_type: str) -> None:
         write_status_snapshot_json()
 
 
+def run_publish_from_args(args: argparse.Namespace) -> None:
+    from publish_legacy_artifacts import run_publish  # noqa: WPS433
+
+    source_by_universe = {
+        "sp500": (args.source_sp500 or args.equity_source).strip().lower(),
+        "nasdaq100": (args.source_nasdaq100 or args.equity_source).strip().lower(),
+        "dow30": (args.source_dow30 or args.equity_source).strip().lower(),
+        "fx": (args.source_fx or args.equity_source).strip().lower(),
+    }
+    run_publish(
+        data_repo=Path(args.data_repo).expanduser(),
+        universes=[u.lower() for u in args.universes],
+        source_by_universe=source_by_universe,
+        lookback=int(args.lookback),
+        force_refresh=bool(args.force_refresh),
+        trigger_type=args.trigger_type,
+        github_user=args.github_user,
+        use_existing_parquet=bool(args.use_existing_parquet),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the repo-local rebuild pipeline.")
     parser.add_argument(
@@ -121,14 +142,32 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        default=os.environ.get("MKTME_PIPELINE_MODE", "probe"),
-        choices=["probe"],
-        help="Pipeline mode. Probe reads legacy sources and records health metadata.",
+        default=os.environ.get("MKTME_PIPELINE_MODE", "publish"),
+        choices=["probe", "publish"],
+        help="Pipeline mode. Publish refreshes local data artifacts; probe only records source health.",
     )
+    parser.add_argument("--data-repo", default=os.environ.get("MKTME_DATA_REPO", str(ROOT / "mktme-data")))
+    parser.add_argument("--lookback", type=int, default=int(os.environ.get("MKTME_LOOKBACK", "252")))
+    parser.add_argument("--github-user", default=os.environ.get("MKTME_GITHUB_USER", "marshdoggo"))
+    parser.add_argument("--force-refresh", action="store_true", default=os.environ.get("MKTME_FORCE_REFRESH", "").lower() in {"1", "true", "yes"})
+    parser.add_argument("--use-existing-parquet", action="store_true")
+    parser.add_argument(
+        "--universes",
+        nargs="+",
+        default=os.environ.get("MKTME_UNIVERSES", "sp500 nasdaq100 dow30 fx").split(),
+        choices=["sp500", "nasdaq100", "dow30", "fx"],
+    )
+    parser.add_argument("--equity-source", default=os.environ.get("MKTME_EQUITY_SOURCE", "auto"))
+    parser.add_argument("--source-sp500", default=os.environ.get("MKTME_SOURCE_SP500", ""))
+    parser.add_argument("--source-nasdaq100", default=os.environ.get("MKTME_SOURCE_NASDAQ100", ""))
+    parser.add_argument("--source-dow30", default=os.environ.get("MKTME_SOURCE_DOW30", ""))
+    parser.add_argument("--source-fx", default=os.environ.get("MKTME_SOURCE_FX", ""))
     args = parser.parse_args()
 
     if args.mode == "probe":
         run_probe(trigger_type=args.trigger_type)
+    elif args.mode == "publish":
+        run_publish_from_args(args)
 
 
 if __name__ == "__main__":

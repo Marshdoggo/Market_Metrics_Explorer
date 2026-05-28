@@ -1,0 +1,1 @@
+0 18 * * 1-5 /Users/marshallwhiteley/Desktop/Market_Metrics_Explorer/scripts/mktme_daily_publish.sh >> /Users/marshallwhiteley/Desktop/Market_Metrics_Explorer/data/runtime/mktme_daily_publish.log 2>&1
