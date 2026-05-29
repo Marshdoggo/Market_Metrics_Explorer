@@ -264,12 +264,32 @@ def _write_report_artifacts(
 
 def _write_manifest(data_repo: Path, rel_paths: dict[str, str], github_user: str) -> dict[str, Any]:
     base_url = f"https://raw.githubusercontent.com/{github_user}/mktme-data/main"
+    manifest_path = data_repo / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            manifest = {}
+    else:
+        manifest = {}
+
+    existing_universes = manifest.get("universes")
+    if not isinstance(existing_universes, dict):
+        existing_universes = {}
+
     manifest = {
         "generated_at": utc_now_iso(),
         "base_url": base_url,
-        "universes": {u: {"parquet_url": f"{base_url}/{rel}"} for u, rel in rel_paths.items()},
+        "universes": existing_universes,
     }
-    manifest_path = data_repo / "manifest.json"
+    for prices_path in sorted(data_repo.glob("*/prices.parquet")):
+        universe = prices_path.parent.name
+        rel_path = prices_path.relative_to(data_repo).as_posix()
+        manifest["universes"].setdefault(universe, {"parquet_url": f"{base_url}/{rel_path}"})
+
+    for universe, rel_path in rel_paths.items():
+        manifest["universes"][universe] = {"parquet_url": f"{base_url}/{rel_path}"}
+
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest
 
