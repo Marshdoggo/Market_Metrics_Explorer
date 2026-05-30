@@ -95,7 +95,7 @@ jobs:
             export MKTME_SOURCE_SP500="twelvedata"
             export MKTME_SOURCE_NASDAQ100="twelvedata"
             export MKTME_SOURCE_DOW30="twelvedata"
-            export MKTME_SOURCE_FX="auto"
+            export MKTME_SOURCE_FX="alphavantage"
             UNIVERSES="sp500 nasdaq100 dow30 fx"
             USE_EXISTING_PARQUET="false"
           fi
