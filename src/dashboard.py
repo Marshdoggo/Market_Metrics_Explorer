@@ -748,6 +748,66 @@ else:
             if not summary.get("available"):
                 st.info(f"No movement history is available for {mv_metric}.")
             else:
+                def _movement_display(df: pd.DataFrame, metric_name: str, rank_label: str = "Rank") -> pd.DataFrame:
+                    if not isinstance(df, pd.DataFrame) or df.empty:
+                        return pd.DataFrame()
+                    out = df.copy()
+                    rename_map = {
+                        "ticker": "Ticker",
+                        "name": "Name",
+                        "sector": "Sector",
+                        "subindustry": "SubIndustry",
+                        "rank": rank_label,
+                        "previous_rank": "Previous Rank",
+                        "rank_change": "Rank Change",
+                        "metric_value": metric_name,
+                    }
+                    out = out.rename(columns=rename_map)
+                    cols = [
+                        rank_label,
+                        "Previous Rank",
+                        "Rank Change",
+                        "Ticker",
+                        "Name",
+                        "Sector",
+                        "SubIndustry",
+                        metric_name,
+                    ]
+                    keep = [c for c in cols if c in out.columns]
+                    out = out[keep].copy()
+                    for c in [rank_label, "Previous Rank", "Rank Change"]:
+                        if c in out.columns:
+                            out[c] = pd.to_numeric(out[c], errors="coerce").astype("Int64")
+                    if metric_name in out.columns:
+                        out[metric_name] = pd.to_numeric(out[metric_name], errors="coerce").round(6)
+                    for c in ["Ticker", "Name", "Sector", "SubIndustry"]:
+                        if c in out.columns:
+                            out[c] = out[c].fillna("").astype(str)
+                    return out
+
+                def _persistence_display(df: pd.DataFrame) -> pd.DataFrame:
+                    if not isinstance(df, pd.DataFrame) or df.empty:
+                        return pd.DataFrame()
+                    out = df.rename(
+                        columns={
+                            "ticker": "Ticker",
+                            "name": "Name",
+                            "sector": "Sector",
+                            "days_in_top_5": "Days Top 5",
+                            "days_in_top_10": "Days Top 10",
+                            "latest_rank": "Latest Rank",
+                        }
+                    )
+                    cols = ["Ticker", "Name", "Sector", "Days Top 5", "Days Top 10", "Latest Rank"]
+                    out = out[[c for c in cols if c in out.columns]].copy()
+                    for c in ["Days Top 5", "Days Top 10", "Latest Rank"]:
+                        if c in out.columns:
+                            out[c] = pd.to_numeric(out[c], errors="coerce").astype("Int64")
+                    for c in ["Ticker", "Name", "Sector"]:
+                        if c in out.columns:
+                            out[c] = out[c].fillna("").astype(str)
+                    return out
+
                 current = summary.get("current", pd.DataFrame())
                 if isinstance(current, pd.DataFrame) and not current.empty:
                     show = current.rename(
@@ -771,25 +831,25 @@ else:
                 c_new, c_drop = st.columns(2)
                 with c_new:
                     st.markdown("#### New entrants")
-                    df_new = summary.get("new_entrants", pd.DataFrame())
+                    df_new = _movement_display(summary.get("new_entrants", pd.DataFrame()), mv_metric)
                     st.dataframe(df_new, use_container_width=True, hide_index=True) if isinstance(df_new, pd.DataFrame) and not df_new.empty else st.caption("None in this window.")
                 with c_drop:
                     st.markdown("#### Dropouts")
-                    df_drop = summary.get("dropouts", pd.DataFrame())
+                    df_drop = _movement_display(summary.get("dropouts", pd.DataFrame()), mv_metric)
                     st.dataframe(df_drop, use_container_width=True, hide_index=True) if isinstance(df_drop, pd.DataFrame) and not df_drop.empty else st.caption("None in this window.")
 
                 c_persist, c_climb, c_fall = st.columns(3)
                 with c_persist:
                     st.markdown("#### Persistence")
-                    df_p = summary.get("persistence", pd.DataFrame())
+                    df_p = _persistence_display(summary.get("persistence", pd.DataFrame()))
                     st.dataframe(df_p, use_container_width=True, hide_index=True) if isinstance(df_p, pd.DataFrame) and not df_p.empty else st.caption("No persistence stats yet.")
                 with c_climb:
                     st.markdown("#### Biggest climbers")
-                    df_c = summary.get("climbers", pd.DataFrame())
+                    df_c = _movement_display(summary.get("climbers", pd.DataFrame()), mv_metric)
                     st.dataframe(df_c, use_container_width=True, hide_index=True) if isinstance(df_c, pd.DataFrame) and not df_c.empty else st.caption("Needs at least two snapshots.")
                 with c_fall:
                     st.markdown("#### Biggest fallers")
-                    df_f = summary.get("fallers", pd.DataFrame())
+                    df_f = _movement_display(summary.get("fallers", pd.DataFrame()), mv_metric)
                     st.dataframe(df_f, use_container_width=True, hide_index=True) if isinstance(df_f, pd.DataFrame) and not df_f.empty else st.caption("Needs at least two snapshots.")
 
     with rank_tab:
