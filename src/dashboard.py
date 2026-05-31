@@ -832,25 +832,40 @@ else:
                 with c_new:
                     st.markdown("#### New entrants")
                     df_new = _movement_display(summary.get("new_entrants", pd.DataFrame()), mv_metric)
-                    st.dataframe(df_new, use_container_width=True, hide_index=True) if isinstance(df_new, pd.DataFrame) and not df_new.empty else st.caption("None in this window.")
+                    if isinstance(df_new, pd.DataFrame) and not df_new.empty:
+                        st.dataframe(df_new, use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("None in this window.")
                 with c_drop:
                     st.markdown("#### Dropouts")
                     df_drop = _movement_display(summary.get("dropouts", pd.DataFrame()), mv_metric)
-                    st.dataframe(df_drop, use_container_width=True, hide_index=True) if isinstance(df_drop, pd.DataFrame) and not df_drop.empty else st.caption("None in this window.")
+                    if isinstance(df_drop, pd.DataFrame) and not df_drop.empty:
+                        st.dataframe(df_drop, use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("None in this window.")
 
                 c_persist, c_climb, c_fall = st.columns(3)
                 with c_persist:
                     st.markdown("#### Persistence")
                     df_p = _persistence_display(summary.get("persistence", pd.DataFrame()))
-                    st.dataframe(df_p, use_container_width=True, hide_index=True) if isinstance(df_p, pd.DataFrame) and not df_p.empty else st.caption("No persistence stats yet.")
+                    if isinstance(df_p, pd.DataFrame) and not df_p.empty:
+                        st.dataframe(df_p, use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("No persistence stats yet.")
                 with c_climb:
                     st.markdown("#### Biggest climbers")
                     df_c = _movement_display(summary.get("climbers", pd.DataFrame()), mv_metric)
-                    st.dataframe(df_c, use_container_width=True, hide_index=True) if isinstance(df_c, pd.DataFrame) and not df_c.empty else st.caption("Needs at least two snapshots.")
+                    if isinstance(df_c, pd.DataFrame) and not df_c.empty:
+                        st.dataframe(df_c, use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("Needs at least two snapshots.")
                 with c_fall:
                     st.markdown("#### Biggest fallers")
                     df_f = _movement_display(summary.get("fallers", pd.DataFrame()), mv_metric)
-                    st.dataframe(df_f, use_container_width=True, hide_index=True) if isinstance(df_f, pd.DataFrame) and not df_f.empty else st.caption("Needs at least two snapshots.")
+                    if isinstance(df_f, pd.DataFrame) and not df_f.empty:
+                        st.dataframe(df_f, use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("Needs at least two snapshots.")
 
     with rank_tab:
         if history.empty:
