@@ -16,6 +16,7 @@ import json
 import requests
 import hashlib
 from datetime import date
+from pathlib import Path
 import matplotlib.pyplot as plt
 from scipy.cluster.hierarchy import linkage, dendrogram
 from scipy.spatial.distance import squareform
@@ -23,6 +24,16 @@ from scipy.spatial.distance import squareform
 from fetch_data import get_sp500_constituents, get_meta
 from compute_metrics import compute_all_metrics
 from metrics_registry import METRICS
+from leaderboards import (
+    available_leaderboard_metrics,
+    canonical_metric,
+    current_leaderboard_with_change,
+    leaderboard_table,
+    load_snapshots_from_url,
+    movement_summary,
+    rank_time_series,
+    snapshot_path as leaderboard_snapshot_path,
+)
 from metric_docs import METRIC_META, get_pair_guide
 from plot_metrics import scatter_xy
 from universes import get_universe
@@ -44,6 +55,9 @@ from ai_context import (
 from health_status import build_dashboard_health
 from status_store import list_recent_reports
 # ------------------------------------------------------------------------------
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+DEFAULT_DATA_BASE_URL = "https://raw.githubusercontent.com/marshdoggo/mktme-data/main"
 
 
 # --- Manifest/Parquet loader (prefer external loader.py; fallback to inline) ----
@@ -104,6 +118,18 @@ def _safe_date_bounds(prices):
         pass
     today = pd.Timestamp.today(tz="UTC").normalize()
     return (today - pd.Timedelta(days=365)).date(), today.date()
+
+
+@st.cache_data(ttl=5*60)
+def _load_leaderboard_history(universe: str, lookback: int, cache_key: str) -> pd.DataFrame:
+    local_data_repo = os.environ.get("MKTME_DATA_REPO", os.path.join(PROJECT_ROOT, "mktme-data"))
+    local_path = leaderboard_snapshot_path(Path(local_data_repo), universe, int(lookback))
+    if local_path.exists():
+        return pd.read_parquet(local_path)
+
+    base_url = os.environ.get("MKTME_LEADERBOARDS_BASE_URL", DEFAULT_DATA_BASE_URL).rstrip("/")
+    url = f"{base_url}/leaderboards/{universe}/lookback_{int(lookback)}.parquet"
+    return load_snapshots_from_url(url)
 
 st.set_page_config(page_title='S&P 500 Metric Explorer', layout='wide')
 
@@ -637,6 +663,150 @@ if compare and metrics_df_B is not None:
         render_view(f"View B — {asof2_ts.date()} :: {y_metric} vs {x_metric}", metrics_df_B, axis_ranges=axis_ranges_B)
 else:
     render_view(f"{y_metric} vs {x_metric}", metrics_df_A, axis_ranges=axis_ranges_A)
+
+# --- Metric leaderboards --------------------------------------------------------
+st.markdown('---')
+st.subheader('Metric Leaderboards')
+
+available_metrics = available_leaderboard_metrics(metrics_df_A)
+if not available_metrics:
+    st.info("No supported numeric leaderboard metrics are available for this view.")
+else:
+    lb_tab, move_tab, rank_tab = st.tabs(["Leaderboards", "Movement", "Rank Over Time"])
+
+    with lb_tab:
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            lb_options = available_metrics + [
+                "Worst Max Drawdown",
+                "Most Defensive Max Drawdown",
+            ] if "Max Drawdown" in available_metrics else available_metrics
+            lb_metric_choice = st.selectbox("Metric", lb_options, key="lb_metric")
+        with c2:
+            lb_top_n = st.selectbox("Top N", [5, 10, 20], index=1, key="lb_top_n")
+        with c3:
+            lb_direction = st.selectbox("Direction", ["Highest / strongest", "Lowest / weakest"], key="lb_direction")
+
+        if lb_metric_choice == "Worst Max Drawdown":
+            lb_metric = "Max Drawdown"
+            lb_dir = "weakest"
+        elif lb_metric_choice == "Most Defensive Max Drawdown":
+            lb_metric = "Max Drawdown"
+            lb_dir = "strongest"
+        else:
+            lb_metric = canonical_metric(lb_metric_choice)
+            lb_dir = "strongest" if lb_direction == "Highest / strongest" else "weakest"
+
+        lb_df = leaderboard_table(metrics_df_A, metric=lb_metric, n=int(lb_top_n), direction=lb_dir)
+        if lb_df.empty:
+            st.info(f"No leaderboard rows are available for {lb_metric_choice}.")
+        else:
+            st.dataframe(lb_df, use_container_width=True, hide_index=True)
+
+    history = pd.DataFrame()
+    history_error = None
+    try:
+        history = _load_leaderboard_history(universe, int(lookback), cache_key=str(max_day))
+    except Exception as exc:
+        history_error = exc
+
+    with move_tab:
+        if history.empty:
+            st.info(
+                "No leaderboard history is published for this universe/lookback yet. "
+                "Run the backfill once, then daily appends will keep this section moving."
+            )
+            if history_error is not None:
+                st.caption(f"History load detail: {type(history_error).__name__}: {history_error}")
+        else:
+            c1, c2, c3 = st.columns([2, 1, 1])
+            with c1:
+                mv_metric = st.selectbox("Movement metric", available_metrics, key="movement_metric")
+            with c2:
+                mv_top_n = st.selectbox("Top N", [5, 10, 20], index=1, key="movement_top_n")
+            with c3:
+                mv_window = st.selectbox("History window", [20, 60, 120, 252], index=0, key="movement_window")
+            summary = movement_summary(history, mv_metric, top_n=int(mv_top_n), window=int(mv_window))
+            if not summary.get("available"):
+                st.info(f"No movement history is available for {mv_metric}.")
+            else:
+                current = summary.get("current", pd.DataFrame())
+                if isinstance(current, pd.DataFrame) and not current.empty:
+                    show = current.rename(
+                        columns={
+                            "ticker": "Ticker",
+                            "name": "Name",
+                            "sector": "Sector",
+                            "metric_value": mv_metric,
+                            "current_rank": "Current Rank",
+                            "previous_rank": "Previous Rank",
+                            "rank_change": "Rank Change",
+                        }
+                    )
+                    st.markdown("#### Current leaderboard with rank change")
+                    st.dataframe(
+                        show[[c for c in ["Current Rank", "Previous Rank", "Rank Change", "Ticker", "Name", "Sector", mv_metric] if c in show.columns]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                c_new, c_drop = st.columns(2)
+                with c_new:
+                    st.markdown("#### New entrants")
+                    df_new = summary.get("new_entrants", pd.DataFrame())
+                    st.dataframe(df_new, use_container_width=True, hide_index=True) if isinstance(df_new, pd.DataFrame) and not df_new.empty else st.caption("None in this window.")
+                with c_drop:
+                    st.markdown("#### Dropouts")
+                    df_drop = summary.get("dropouts", pd.DataFrame())
+                    st.dataframe(df_drop, use_container_width=True, hide_index=True) if isinstance(df_drop, pd.DataFrame) and not df_drop.empty else st.caption("None in this window.")
+
+                c_persist, c_climb, c_fall = st.columns(3)
+                with c_persist:
+                    st.markdown("#### Persistence")
+                    df_p = summary.get("persistence", pd.DataFrame())
+                    st.dataframe(df_p, use_container_width=True, hide_index=True) if isinstance(df_p, pd.DataFrame) and not df_p.empty else st.caption("No persistence stats yet.")
+                with c_climb:
+                    st.markdown("#### Biggest climbers")
+                    df_c = summary.get("climbers", pd.DataFrame())
+                    st.dataframe(df_c, use_container_width=True, hide_index=True) if isinstance(df_c, pd.DataFrame) and not df_c.empty else st.caption("Needs at least two snapshots.")
+                with c_fall:
+                    st.markdown("#### Biggest fallers")
+                    df_f = summary.get("fallers", pd.DataFrame())
+                    st.dataframe(df_f, use_container_width=True, hide_index=True) if isinstance(df_f, pd.DataFrame) and not df_f.empty else st.caption("Needs at least two snapshots.")
+
+    with rank_tab:
+        if history.empty:
+            st.info("No leaderboard history exists yet for rank-over-time charts.")
+        else:
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                rt_metric = st.selectbox("Rank metric", available_metrics, key="rank_metric")
+            with c2:
+                rt_window = st.selectbox("Rank window", [20, 60, 120, 252], index=0, key="rank_window")
+            default_tickers = (
+                current_leaderboard_with_change(history, rt_metric, 5)
+                .get("ticker", pd.Series(dtype=str))
+                .dropna()
+                .astype(str)
+                .tolist()
+            )
+            options = sorted(metrics_df_A["Ticker"].dropna().astype(str).str.upper().unique().tolist())
+            selected_tickers = st.multiselect(
+                "Tickers",
+                options,
+                default=[t for t in default_tickers if t in options][:5],
+                key="rank_tickers",
+            )
+            ts_df = rank_time_series(history, rt_metric, selected_tickers, window=int(rt_window))
+            if ts_df.empty:
+                st.info("Choose tickers with available history to render the rank time series.")
+            else:
+                import plotly.express as px
+
+                fig = px.line(ts_df, x="as_of_date", y="rank", color="ticker", markers=True)
+                fig.update_yaxes(autorange="reversed", title="Rank")
+                fig.update_xaxes(title="As-of date")
+                st.plotly_chart(fig, use_container_width=True)
 
 # --- Delta panel: compare highlighted tickers A → B ---
 if compare and metrics_df_B is not None and highlight:

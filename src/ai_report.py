@@ -141,6 +141,7 @@ def build_facts_block(report: Dict[str, Any]) -> Dict[str, Any]:
         "primary_rank_metric": report.get("primary_rank_metric"),
         "distribution": report.get("distribution", {}),
         "extremes": report.get("extremes", {}),
+        "leaderboard_context": report.get("leaderboard_context", {}),
         "leaders": {},
     }
 
@@ -180,6 +181,7 @@ def llm_facts_payload(daily: 'DailyReport') -> Dict[str, Any]:
         "distribution": daily.facts.get("distribution", {}),
         "extremes": daily.facts.get("extremes", {}),
         "leaders": daily.facts.get("leaders", {}),
+        "leaderboard_context": daily.facts.get("leaderboard_context", {}),
         "sector_summary": daily.facts.get("sector_summary", {}),
     }
 
@@ -350,6 +352,7 @@ def generate_daily_report(
     lookback: int,
     primary_rank_metric: str = "Annualized Sharpe",
     top_n: int = 5,
+    leaderboard_context: Dict[str, Any] | None = None,
 ) -> DailyReport:
     """
     Build a TradingEconomics-style brief from the metrics table.
@@ -446,9 +449,11 @@ def generate_daily_report(
             "rsi_low": low_rsi_row,
         },
         "sector_summary": sector_block,
+        "leaderboard_context": leaderboard_context or {"available": False},
         "notes": [
-            f"Tables are computed from the app's cached price dataset and metrics pipeline.",
+            f"Leaderboards are computed from the app's cached price dataset and metrics pipeline.",
             f"'top_by_primary_metric' is sorted by {primary_rank_metric} descending (higher first).",
+            "The dashboard is the source of truth for full numeric leaderboards; this report comments on persistence, movement, anomalies, and breadth.",
         ],
     }
 
@@ -464,23 +469,6 @@ def _render_markdown(report: Dict[str, Any]) -> str:
     lb = report.get("lookback_trading_days", "?")
     prim = report.get("primary_rank_metric", "Annualized Sharpe")
 
-    def _md_table(rows: List[Dict[str, Any]], title: str, max_rows: int = 5) -> str:
-        if not rows:
-            return f"### {title}\n\n_(no data)_\n"
-        rows = rows[:max_rows]
-        cols = list(rows[0].keys())
-        lines = [f"### {title}", ""]
-        lines.append("| " + " | ".join(cols) + " |")
-        lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
-        for r in rows:
-            vals = []
-            for c in cols:
-                v = r.get(c)
-                vals.append("" if v is None else str(v))
-            lines.append("| " + " | ".join(vals) + " |")
-        lines.append("")
-        return "\n".join(lines)
-
     blocks = []
     blocks.append(f"# Market Metric Explorer — Daily Brief\n")
     uni_line = f"- Universe: **{u}**" + (f" ({usz} tickers)" if usz is not None else "")
@@ -494,7 +482,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
     dist = report.get("distribution", {}) or {}
     ext = report.get("extremes", {}) or {}
 
-    blocks.append("## Headlines\n")
+    blocks.append("## Tape Read\n")
 
     prim_stats = dist.get("primary_metric", {})
     if prim_stats.get("available"):
@@ -513,40 +501,66 @@ def _render_markdown(report: Dict[str, Any]) -> str:
     if rhi.get("available") and rlo.get("available"):
         blocks.append(f"- RSI extremes (14): highest **{rhi.get('Ticker')}** ({rhi.get('value')}), lowest **{rlo.get('Ticker')}** ({rlo.get('value')}).")
 
-    blocks.append("")
-
     lbs = report.get("leaderboards", {})
-    blocks.append(_md_table(lbs.get("top_by_primary_metric", []), f"Top by {prim}"))
-    if lbs.get("top_by_sortino"):
-        blocks.append(_md_table(lbs.get("top_by_sortino", []), "Top by Sortino Ratio"))
-    if lbs.get("top_by_cagr"):
-        blocks.append(_md_table(lbs.get("top_by_cagr", []), "Top by CAGR"))
-    if lbs.get("worst_by_max_drawdown"):
-        blocks.append(_md_table(lbs.get("worst_by_max_drawdown", []), "Worst by Max Drawdown"))
-    if lbs.get("top_by_volatility"):
-        blocks.append(_md_table(lbs.get("top_by_volatility", []), "Top by Daily Volatility (Std)"))
+    lb_ctx = report.get("leaderboard_context", {}) or {}
+    primary_rows = lbs.get("top_by_primary_metric", []) or []
+    if primary_rows:
+        names = ", ".join(str(r.get("Ticker")) for r in primary_rows[:5] if r.get("Ticker"))
+        blocks.append(f"- Current {prim} leadership is led by **{names}**.")
+
+    if lb_ctx.get("available"):
+        metric_ctx = lb_ctx.get("metrics", {}) or {}
+        primary_ctx = metric_ctx.get(prim, {}) or {}
+        if primary_ctx.get("has_previous"):
+            entrants = _ticker_phrase(primary_ctx.get("new_entrants", []))
+            dropouts = _ticker_phrase(primary_ctx.get("dropouts", []))
+            climbers = _ticker_phrase(primary_ctx.get("climbers", []), include_change=True)
+            fallers = _ticker_phrase(primary_ctx.get("fallers", []), include_change=True)
+            if entrants:
+                blocks.append(f"- New top-list entrants on {prim}: {entrants}.")
+            if dropouts:
+                blocks.append(f"- Dropped out of the current top list: {dropouts}.")
+            if climbers:
+                blocks.append(f"- Biggest rank climbers: {climbers}.")
+            if fallers:
+                blocks.append(f"- Biggest rank fallers: {fallers}.")
+        else:
+            blocks.append("- Leaderboard history is at its first snapshot baseline; movement commentary starts after the next snapshot.")
+
+        persistence = primary_ctx.get("persistence", [])
+        if persistence:
+            sticky = _ticker_phrase(persistence, include_persistence=True)
+            blocks.append(f"- Persistence check: {sticky}.")
+    else:
+        blocks.append("- Leaderboard history is not available yet, so this is a baseline read rather than a movement report.")
+
+    dd_rows = lbs.get("worst_by_max_drawdown", []) or []
+    if dd_rows:
+        names = ", ".join(str(r.get("Ticker")) for r in dd_rows[:5] if r.get("Ticker"))
+        blocks.append(f"- Worst max-drawdown screen flags **{names}** for the deepest trailing drawdown profiles.")
+
+    defensive = []
+    dd_metric_ctx = (lb_ctx.get("metrics", {}) or {}).get("Max Drawdown", {}) if lb_ctx.get("available") else {}
+    for r in dd_metric_ctx.get("current", [])[:5]:
+        if r.get("ticker"):
+            defensive.append(str(r.get("ticker")))
+    if defensive:
+        blocks.append(f"- Most defensive drawdown ranks currently favor **{', '.join(defensive)}**.")
 
     sec = report.get("sector_summary", {})
     if sec.get("available"):
-        blocks.append("## Sector Summary\n")
-        blocks.append(f"Metric: **{sec.get('metric')}**\n")
+        blocks.append("\n## Breadth\n")
+        blocks.append(f"- Sector read uses **{sec.get('metric')}** as the cross-sectional lens.")
         best = sec.get("best_by_mean", [])
         worst = sec.get("worst_by_mean", [])
+        if best:
+            blocks.append(f"- Strongest sector means: {_sector_phrase(best)}.")
+        if worst:
+            blocks.append(f"- Weakest sector means: {_sector_phrase(worst)}.")
 
-        def _sec_table(rows: List[Dict[str, Any]], title: str) -> str:
-            if not rows:
-                return f"### {title}\n\n_(no data)_\n"
-            cols = list(rows[0].keys())
-            lines = [f"### {title}", ""]
-            lines.append("| " + " | ".join(cols) + " |")
-            lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
-            for r in rows:
-                lines.append("| " + " | ".join(str(r.get(c, "")) for c in cols) + " |")
-            lines.append("")
-            return "\n".join(lines)
-
-        blocks.append(_sec_table(best, "Best sectors by mean"))
-        blocks.append(_sec_table(worst, "Worst sectors by mean"))
+    blocks.append("\n## Caveats\n")
+    blocks.append("- No investment recommendations. Price-derived metrics describe behavior, not causes.")
+    blocks.append("- No news or macro context was supplied, so the report avoids causal claims about why names moved.")
 
     notes = report.get("notes", [])
     if notes:
@@ -556,6 +570,34 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         blocks.append("")
 
     return "\n".join(blocks)
+
+
+def _ticker_phrase(rows: List[Dict[str, Any]], include_change: bool = False, include_persistence: bool = False) -> str:
+    parts = []
+    for r in rows[:5]:
+        ticker = r.get("ticker") or r.get("Ticker")
+        if not ticker:
+            continue
+        text = f"**{ticker}**"
+        if include_change and r.get("rank_change") is not None:
+            text += f" ({int(r.get('rank_change')):+d})"
+        if include_persistence:
+            top5 = r.get("days_in_top_5")
+            top10 = r.get("days_in_top_10")
+            if top5 is not None or top10 is not None:
+                text += f" ({top5 or 0} top-5, {top10 or 0} top-10 snapshots)"
+        parts.append(text)
+    return ", ".join(parts)
+
+
+def _sector_phrase(rows: List[Dict[str, Any]]) -> str:
+    parts = []
+    for r in rows[:3]:
+        sector = r.get("Sector")
+        mean = r.get("mean")
+        if sector is not None and mean is not None:
+            parts.append(f"**{sector}** ({mean})")
+    return ", ".join(parts)
 
 
 # ----------------------------- Save / Load -------------------------------------

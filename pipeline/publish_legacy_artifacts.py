@@ -20,6 +20,13 @@ if str(SRC_DIR) not in sys.path:
 from ai_report import generate_daily_report, save_report_json, save_report_markdown  # noqa: E402
 from compute_metrics import compute_all_metrics  # noqa: E402
 from fetch_data import download_prices, download_prices_fx_window, get_sp500_constituents  # noqa: E402
+from leaderboards import (  # noqa: E402
+    append_snapshot_rows,
+    build_leaderboard_snapshots,
+    read_snapshot_file,
+    report_context,
+    snapshot_path,
+)
 from status_store import (  # noqa: E402
     finish_pipeline_run,
     init_db,
@@ -200,6 +207,7 @@ def _write_report_artifacts(
     universe: str,
     metrics_df: pd.DataFrame,
     lookback: int,
+    leaderboard_context: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, str]]:
     asof_date = pd.to_datetime(metrics_df.get("AsOfDate", pd.Timestamp.utcnow())).max()
     if isinstance(asof_date, pd.Timestamp):
@@ -214,6 +222,7 @@ def _write_report_artifacts(
         lookback=lookback,
         primary_rank_metric="Annualized Sharpe",
         top_n=5,
+        leaderboard_context=leaderboard_context,
     )
     daily.report["facts"] = daily.facts
     daily.report["run_utc"] = utc_now_iso()
@@ -260,6 +269,30 @@ def _write_report_artifacts(
         "json_path": f"reports/{universe}/{asof_date}.json",
         "facts_path": f"reports/{universe}/{asof_date}.facts.json",
     }
+
+
+def _append_daily_leaderboard_snapshot(
+    *,
+    data_repo: Path,
+    universe: str,
+    metrics_df: pd.DataFrame,
+    lookback: int,
+    asof_date: str,
+) -> tuple[Path, int, pd.DataFrame]:
+    out_path = snapshot_path(data_repo, universe, lookback)
+    rows = build_leaderboard_snapshots(
+        metrics_df,
+        universe=universe,
+        as_of_date=asof_date,
+        lookback=lookback,
+        source_mode="daily_append",
+    )
+    history, added = append_snapshot_rows(rows, out_path, force=False)
+    if added:
+        print(f"[leaderboards] Appended {added} rows to {out_path}", flush=True)
+    else:
+        print(f"[leaderboards] Snapshot already exists for {universe} {asof_date}; skipped.", flush=True)
+    return out_path, added, history
 
 
 def _write_manifest(data_repo: Path, rel_paths: dict[str, str], github_user: str) -> dict[str, Any]:
@@ -357,7 +390,8 @@ def run_publish(
             _assert_not_stale_publish(data_repo=data_repo, universe=universe, prices=prices)
 
             metrics_df = _build_metrics(prices, tickers_df, lookback=lookback)
-            metrics_df["AsOfDate"] = pd.to_datetime(prices.index.max()).date().isoformat()
+            asof_date = pd.to_datetime(prices.index.max()).date().isoformat()
+            metrics_df["AsOfDate"] = asof_date
 
             rel_path, snapshot_path = _write_prices_parquet(data_repo, universe, prices)
             rel_paths[universe] = rel_path
@@ -369,11 +403,30 @@ def run_publish(
                 row_count=int(prices.shape[0]),
             )
 
+            leaderboard_artifact, leaderboard_rows_added, leaderboard_history = _append_daily_leaderboard_snapshot(
+                data_repo=data_repo,
+                universe=universe,
+                metrics_df=metrics_df,
+                lookback=lookback,
+                asof_date=asof_date,
+            )
+            if leaderboard_history.empty:
+                leaderboard_history = read_snapshot_file(leaderboard_artifact)
+            leaderboard_ctx = report_context(
+                leaderboard_history,
+                metrics_df,
+                top_n=5,
+                window=20,
+            )
+            leaderboard_ctx["artifact_path"] = leaderboard_artifact.relative_to(data_repo).as_posix()
+            leaderboard_ctx["rows_added"] = leaderboard_rows_added
+
             asof_dates[universe], report_paths = _write_report_artifacts(
                 data_repo=data_repo,
                 universe=universe,
                 metrics_df=metrics_df,
                 lookback=lookback,
+                leaderboard_context=leaderboard_ctx,
             )
             record_report(
                 universe=universe,
