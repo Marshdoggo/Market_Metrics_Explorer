@@ -24,10 +24,23 @@ except Exception:
     compute_all_metrics = None
 
 
-def _ticker_frame(universe: str) -> pd.DataFrame:
-    if universe == "sp500":
-        return get_sp500_constituents(force_refresh=False)
-    return get_universe(universe, force_refresh=False)
+def _ticker_frame(universe: str, price_columns: list[str] | None = None) -> pd.DataFrame:
+    try:
+        if universe == "sp500":
+            return get_sp500_constituents(force_refresh=False)
+        return get_universe(universe, force_refresh=False)
+    except Exception:
+        if not price_columns:
+            raise
+        tickers = [str(c).upper() for c in price_columns]
+        return pd.DataFrame(
+            {
+                "Ticker": tickers,
+                "Name": tickers,
+                "Sector": universe.upper(),
+                "SubIndustry": "",
+            }
+        )
 
 
 def _build_metrics(prices: pd.DataFrame, tickers_df: pd.DataFrame, lookback: int) -> pd.DataFrame:
@@ -112,7 +125,7 @@ def backfill_leaderboards(
     if prices.empty:
         raise RuntimeError(f"No usable prices found in {prices_path}")
 
-    tickers_df = _ticker_frame(universe)
+    tickers_df = _ticker_frame(universe, price_columns=[str(c) for c in prices.columns])
     symbols = tickers_df["Ticker"].astype(str).tolist()
     prices = prices[[c for c in prices.columns if c in symbols]].copy()
     if prices.empty:
