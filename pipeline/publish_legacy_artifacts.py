@@ -18,7 +18,6 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from ai_report import generate_daily_report, save_report_json, save_report_markdown  # noqa: E402
-from compute_metrics import compute_all_metrics  # noqa: E402
 from fetch_data import download_prices, download_prices_fx_window, get_sp500_constituents  # noqa: E402
 from leaderboards import (  # noqa: E402
     append_snapshot_rows,
@@ -27,6 +26,11 @@ from leaderboards import (  # noqa: E402
     report_context,
     snapshot_path,
 )
+try:
+    from compute_metrics import compute_all_metrics  # noqa: E402
+except Exception:
+    compute_all_metrics = None
+    from backfill_leaderboards import _compute_metrics_fallback  # noqa: E402
 from status_store import (  # noqa: E402
     finish_pipeline_run,
     init_db,
@@ -129,7 +133,10 @@ def _load_or_fetch_prices(
 
 
 def _build_metrics(prices: pd.DataFrame, tickers_df: pd.DataFrame, lookback: int) -> pd.DataFrame:
-    metrics_df = compute_all_metrics(prices, lookback=lookback)
+    if compute_all_metrics is not None:
+        metrics_df = compute_all_metrics(prices, lookback=lookback)
+    else:
+        metrics_df = _compute_metrics_fallback(prices, lookback=lookback)
     metrics_df = metrics_df.join(
         tickers_df.set_index("Ticker")[["Name", "Sector", "SubIndustry"]],
         how="left",
