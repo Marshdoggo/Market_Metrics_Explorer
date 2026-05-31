@@ -68,6 +68,27 @@ def _ticker_frame(universe: str) -> pd.DataFrame:
     return get_universe(universe, force_refresh=False)
 
 
+def _ticker_frame_for_publish(data_repo: Path, universe: str, use_existing_parquet: bool) -> pd.DataFrame:
+    try:
+        return _ticker_frame(universe)
+    except Exception:
+        if not use_existing_parquet:
+            raise
+        prices_path = data_repo / universe / "prices.parquet"
+        if not prices_path.exists():
+            raise
+        prices = pd.read_parquet(prices_path)
+        tickers = [str(c).upper() for c in prices.columns]
+        return pd.DataFrame(
+            {
+                "Ticker": tickers,
+                "Name": tickers,
+                "Sector": universe.upper(),
+                "SubIndustry": "",
+            }
+        )
+
+
 def _normalize_source(raw: str | None, fallback: str) -> str:
     value = (raw or "").strip().lower()
     return value or fallback
@@ -356,7 +377,10 @@ def run_publish(
 
     try:
         data_repo.mkdir(parents=True, exist_ok=True)
-        ticker_frames = {universe: _ticker_frame(universe) for universe in universes}
+        ticker_frames = {
+            universe: _ticker_frame_for_publish(data_repo, universe, use_existing_parquet)
+            for universe in universes
+        }
         prefetched_equity_prices: dict[str, pd.DataFrame] = {}
         grouped_tickers: dict[str, list[str]] = {}
         for universe in universes:
