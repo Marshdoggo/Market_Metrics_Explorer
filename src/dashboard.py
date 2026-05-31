@@ -697,7 +697,25 @@ else:
             lb_metric = canonical_metric(lb_metric_choice)
             lb_dir = "strongest" if lb_direction == "Highest / strongest" else "weakest"
 
-        lb_df = leaderboard_table(metrics_df_A, metric=lb_metric, n=int(lb_top_n), direction=lb_dir)
+        companion_defaults = [
+            m for m in ["Annualized Sharpe", "Sortino Ratio", "CAGR", "Max Drawdown"]
+            if m in available_metrics and m != lb_metric
+        ][:3]
+        companion_metrics = st.multiselect(
+            "Show companion metrics",
+            [m for m in available_metrics if m != lb_metric],
+            default=companion_defaults,
+            key="lb_companion_metrics",
+            help="Rank by the selected metric, while displaying these additional metric columns for context.",
+        )
+
+        lb_df = leaderboard_table(
+            metrics_df_A,
+            metric=lb_metric,
+            n=int(lb_top_n),
+            direction=lb_dir,
+            display_metrics=companion_metrics,
+        )
         if lb_df.empty:
             st.info(f"No leaderboard rows are available for {lb_metric_choice}.")
         else:

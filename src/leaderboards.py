@@ -86,6 +86,7 @@ def leaderboard_table(
     metric: str,
     n: int = 10,
     direction: str = "strongest",
+    display_metrics: list[str] | None = None,
 ) -> pd.DataFrame:
     metric = canonical_metric(metric)
     if metric not in metrics_df.columns:
@@ -100,7 +101,9 @@ def leaderboard_table(
     ascending = metric_sort_ascending(metric, direction)
     out = df.sort_values(metric, ascending=ascending).head(int(n)).copy()
     out.insert(0, "Rank", range(1, len(out) + 1))
-    cols = ["Rank", "Ticker", "Name", "Sector", "SubIndustry", metric]
+    extra_metrics = [canonical_metric(m) for m in (display_metrics or [])]
+    extra_metrics = [m for m in extra_metrics if m in out.columns and m != metric]
+    cols = ["Rank", "Ticker", "Name", "Sector", "SubIndustry", metric] + extra_metrics
     return out[[c for c in cols if c in out.columns]]
 
 
