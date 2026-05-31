@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -13,10 +14,14 @@ SRC_DIR = ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from compute_metrics import compute_all_metrics  # noqa: E402
 from fetch_data import get_sp500_constituents  # noqa: E402
 from leaderboards import append_snapshot_rows, build_leaderboard_snapshots, snapshot_path  # noqa: E402
 from universes import get_universe  # noqa: E402
+
+try:
+    from compute_metrics import compute_all_metrics  # noqa: E402
+except Exception:
+    compute_all_metrics = None
 
 
 def _ticker_frame(universe: str) -> pd.DataFrame:
@@ -26,7 +31,10 @@ def _ticker_frame(universe: str) -> pd.DataFrame:
 
 
 def _build_metrics(prices: pd.DataFrame, tickers_df: pd.DataFrame, lookback: int) -> pd.DataFrame:
-    metrics_df = compute_all_metrics(prices, lookback=lookback)
+    if compute_all_metrics is not None:
+        metrics_df = compute_all_metrics(prices, lookback=lookback)
+    else:
+        metrics_df = _compute_metrics_fallback(prices, lookback=lookback)
     metrics_df = metrics_df.join(
         tickers_df.set_index("Ticker")[["Name", "Sector", "SubIndustry"]],
         how="left",
@@ -34,6 +42,55 @@ def _build_metrics(prices: pd.DataFrame, tickers_df: pd.DataFrame, lookback: int
     metrics_df = metrics_df.reset_index().rename(columns={"index": "Ticker"})
     metrics_df["Ticker"] = metrics_df["Ticker"].astype(str).str.upper()
     return metrics_df
+
+
+def _compute_metrics_fallback(prices_wide: pd.DataFrame, lookback: int) -> pd.DataFrame:
+    data = prices_wide.tail(lookback) if lookback and lookback < len(prices_wide) else prices_wide.copy()
+    out = {}
+    for ticker in data.columns:
+        prices = pd.to_numeric(data[ticker], errors="coerce").dropna()
+        if len(prices) < max(60, int(lookback * 0.4)):
+            continue
+        rets = prices.pct_change().dropna()
+        if rets.empty:
+            continue
+        vol = float(rets.std())
+        mean = float(rets.mean())
+        ann_sharpe = np.nan if vol == 0 else float((mean / vol) * np.sqrt(252))
+        total_return = prices.iloc[-1] / prices.iloc[0] if prices.iloc[0] else np.nan
+        years = len(prices) / 252
+        cagr = np.nan if years <= 0 or total_return <= 0 else float(total_return ** (1 / years) - 1)
+        roll_max = prices.cummax()
+        max_dd = float((prices / roll_max - 1.0).min())
+        downside = np.minimum(rets, 0)
+        downside_dev = float(np.sqrt(np.mean(downside**2)))
+        sortino = np.nan if downside_dev == 0 else float((rets.mean() * 252) / (downside_dev * np.sqrt(252)))
+        delta = prices.diff()
+        up = delta.clip(lower=0).rolling(14).mean()
+        down = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = up.iloc[-1] / down.iloc[-1] if down.iloc[-1] != 0 else np.nan
+        rsi = float(100 - (100 / (1 + rs))) if rs == rs else np.nan
+        ma50 = prices.rolling(50).mean().iloc[-1] if len(prices) >= 50 else np.nan
+        ma200 = prices.rolling(200).mean().iloc[-1] if len(prices) >= 200 else np.nan
+        ma20 = prices.rolling(20).mean()
+        sd20 = prices.rolling(20).std()
+        bw20 = ((ma20 + 2 * sd20) - (ma20 - 2 * sd20)) / ma20
+        out[ticker] = {
+            "Mean Daily Return": mean,
+            "Daily Volatility (Std)": vol,
+            "Annualized Sharpe": ann_sharpe,
+            "Max Drawdown": max_dd,
+            "CAGR": cagr,
+            "Downside Deviation": downside_dev,
+            "Sortino Ratio": sortino,
+            "RSI(14)": rsi,
+            "% Above 50DMA": np.nan if pd.isna(ma50) or ma50 == 0 else float((prices.iloc[-1] / ma50) - 1),
+            "% Above 200DMA": np.nan if pd.isna(ma200) or ma200 == 0 else float((prices.iloc[-1] / ma200) - 1),
+            "Return Skewness": float(rets.skew()) if len(rets) > 3 else np.nan,
+            "Return Kurtosis (Fisher)": float(rets.kurt()) if len(rets) > 3 else np.nan,
+            "Bollinger Bandwidth (20)": float(bw20.iloc[-1]) if len(bw20.dropna()) else np.nan,
+        }
+    return pd.DataFrame.from_dict(out, orient="index")
 
 
 def backfill_leaderboards(
