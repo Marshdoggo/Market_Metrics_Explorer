@@ -54,6 +54,7 @@ from ai_context import (
 )
 from health_status import build_dashboard_health
 from status_store import list_recent_reports
+from forecast_lab.ui import render_forecast_lab
 # ------------------------------------------------------------------------------
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -672,7 +673,7 @@ available_metrics = available_leaderboard_metrics(metrics_df_A)
 if not available_metrics:
     st.info("No supported numeric leaderboard metrics are available for this view.")
 else:
-    lb_tab, move_tab, rank_tab = st.tabs(["Leaderboards", "Movement", "Rank Over Time"])
+    lb_tab, move_tab, rank_tab, forecast_tab = st.tabs(["Leaderboards", "Movement", "Rank Over Time", "Forecast Lab"])
 
     with lb_tab:
         c1, c2, c3 = st.columns([2, 1, 1])
@@ -896,10 +897,45 @@ else:
             else:
                 import plotly.express as px
 
-                fig = px.line(ts_df, x="as_of_date", y="rank", color="ticker", markers=True)
+                ts_plot = ts_df.copy()
+                ts_plot["as_of_date"] = pd.to_datetime(ts_plot["as_of_date"], errors="coerce")
+                unique_dates = ts_plot["as_of_date"].dropna().drop_duplicates().sort_values()
+                gaps = unique_dates.diff().dt.days.dropna()
+                big_gaps = gaps[gaps > 7]
+                if not big_gaps.empty:
+                    st.warning(
+                        "This leaderboard history has missing snapshot dates. "
+                        "Lines are intentionally broken across gaps longer than one week."
+                    )
+                    gap_breaks = []
+                    for ticker, group in ts_plot.dropna(subset=["as_of_date"]).sort_values("as_of_date").groupby("ticker"):
+                        ticker_gaps = group["as_of_date"].diff().dt.days
+                        for idx in ticker_gaps[ticker_gaps > 7].index:
+                            previous_date = group.loc[group.index[group.index.get_loc(idx) - 1], "as_of_date"]
+                            gap_breaks.append(
+                                {
+                                    "as_of_date": previous_date + pd.Timedelta(days=1),
+                                    "rank": pd.NA,
+                                    "ticker": ticker,
+                                }
+                            )
+                    if gap_breaks:
+                        ts_plot = pd.concat([ts_plot, pd.DataFrame(gap_breaks)], ignore_index=True)
+                fig = px.line(ts_plot.sort_values(["ticker", "as_of_date"]), x="as_of_date", y="rank", color="ticker", markers=True)
                 fig.update_yaxes(autorange="reversed", title="Rank")
+                if len(unique_dates) == 1:
+                    only_date = unique_dates.iloc[0]
+                    fig.update_xaxes(range=[only_date - pd.Timedelta(days=1), only_date + pd.Timedelta(days=1)])
                 fig.update_xaxes(title="As-of date")
                 st.plotly_chart(fig, use_container_width=True)
+
+    with forecast_tab:
+        render_forecast_lab(
+            default_universe=universe,
+            lookback=int(lookback),
+            max_day=max_day,
+            load_history=_load_leaderboard_history,
+        )
 
 # --- Delta panel: compare highlighted tickers A → B ---
 if compare and metrics_df_B is not None and highlight:
