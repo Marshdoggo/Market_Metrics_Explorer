@@ -2,7 +2,8 @@ name: Repo Pipeline
 
 on:
   schedule:
-    - cron: "15 2 * * 1-5"
+    # GitHub Actions cron is UTC. Tue-Sat UTC maps to Mon-Fri Pacific evenings.
+    - cron: "15 2 * * 2-6"
   workflow_dispatch:
     inputs:
       universes:
