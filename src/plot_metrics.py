@@ -4,7 +4,7 @@ import plotly.express as px
 
 
 def _size_rank_values(df: pd.DataFrame, size_metric: str) -> pd.Series:
-    values = pd.to_numeric(df[size_metric], errors="coerce")
+    values = pd.to_numeric(df.loc[:, size_metric], errors="coerce")
     if "Drawdown" in size_metric:
         values = values.abs()
     return values.rank(pct=True)
@@ -18,6 +18,7 @@ def scatter_xy(
     title: str='',
     size_metric: str | None = None,
 ):
+    df = df.loc[:, ~df.columns.duplicated()].copy()
     fig, ax = plt.subplots()
     sizes = None
     if size_metric and size_metric in df.columns:
@@ -57,7 +58,7 @@ def scatter_xy_interactive(
     Interactive scatter with hover labels.
     Expects df to include columns: x, y, and ideally 'Ticker','Name','Sector','SubIndustry'.
     """
-    plot_df = df.copy()
+    plot_df = df.loc[:, ~df.columns.duplicated()].copy()
     marker_size_col = None
     if size_metric and size_metric in plot_df.columns:
         marker_size_col = "_MarkerSize"

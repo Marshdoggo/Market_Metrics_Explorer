@@ -429,7 +429,7 @@ def _option_index(options: list[str], value: str) -> int:
 def _plotly_marker_sizes(df: pd.DataFrame, size_col: str | None) -> pd.Series | None:
     if not size_col or size_col not in df.columns:
         return None
-    values = pd.to_numeric(df[size_col], errors='coerce')
+    values = pd.to_numeric(df.loc[:, size_col], errors='coerce')
     if 'Drawdown' in size_col:
         values = values.abs()
     ranks = values.rank(pct=True)
@@ -447,7 +447,7 @@ def _interactive_scatter(
 ):
     import plotly.express as px
 
-    plot_df = df.copy()
+    plot_df = df.loc[:, ~df.columns.duplicated()].copy()
     marker_size_col = None
     if size_col and size_col in plot_df.columns:
         marker_size_col = '_MarkerSize'
@@ -629,7 +629,7 @@ def render_view(title_label: str, metrics_df_local: pd.DataFrame, axis_ranges=No
     for optional_col in [color_by, size_metric]:
         if optional_col:
             cols_needed.append(optional_col)
-    present = [c for c in cols_needed if c in metrics_df_local.columns]
+    present = list(dict.fromkeys(c for c in cols_needed if c in metrics_df_local.columns))
     missing_xy = [c for c in [x_metric, y_metric] if c not in metrics_df_local.columns]
 
     if missing_xy:
