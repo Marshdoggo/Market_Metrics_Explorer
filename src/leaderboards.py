@@ -17,17 +17,29 @@ SUPPORTED_METRICS = [
     "Daily Volatility (Std)",
     "Max Drawdown",
     "Downside Deviation",
-    "RSI(14)",
+    "RSI_14",
     "% Above 50DMA",
     "% Above 200DMA",
     "Return Skewness",
     "Return Kurtosis (Fisher)",
     "Bollinger Bandwidth (20)",
+    "Dip_Buy_Score",
+    "Bear_Breakdown_Score",
+    "Momentum_Continuation_Score",
+    "Distance_50DMA",
+    "Distance_200DMA",
+    "Drawdown_3M_High",
+    "Return_20D",
+    "Return_60D",
+    "Realized_Vol_20D",
+    "ATR_14_Pct",
+    "Volume_Ratio_20D_60D",
 ]
 
 METRIC_ALIASES = {
     "Daily Volatility": "Daily Volatility (Std)",
-    "RSI": "RSI(14)",
+    "RSI": "RSI_14",
+    "RSI(14)": "RSI_14",
 }
 
 HIGHER_IS_STRONGER = {
@@ -38,12 +50,23 @@ HIGHER_IS_STRONGER = {
     "Daily Volatility (Std)": False,
     "Max Drawdown": True,
     "Downside Deviation": False,
-    "RSI(14)": True,
+    "RSI_14": True,
     "% Above 50DMA": True,
     "% Above 200DMA": True,
     "Return Skewness": True,
     "Return Kurtosis (Fisher)": False,
     "Bollinger Bandwidth (20)": False,
+    "Dip_Buy_Score": True,
+    "Bear_Breakdown_Score": True,
+    "Momentum_Continuation_Score": True,
+    "Distance_50DMA": True,
+    "Distance_200DMA": True,
+    "Drawdown_3M_High": True,
+    "Return_20D": True,
+    "Return_60D": True,
+    "Realized_Vol_20D": False,
+    "ATR_14_Pct": False,
+    "Volume_Ratio_20D_60D": True,
 }
 
 SNAPSHOT_COLUMNS = [

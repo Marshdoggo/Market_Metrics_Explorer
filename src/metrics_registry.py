@@ -1,7 +1,21 @@
 import numpy as np
 import pandas as pd
-from scipy.stats import skew, kurtosis
-from utils import to_annualized, pct_from_ma
+
+
+def to_annualized(mean_daily_ret: float, daily_std: float, periods=252):
+    if daily_std and daily_std != 0:
+        return (mean_daily_ret * periods) / (daily_std * np.sqrt(periods))
+    return np.nan
+
+
+def pct_from_ma(series: pd.Series, window: int) -> float:
+    if len(series) < window:
+        return np.nan
+    ma = series.tail(window).mean()
+    last = series.iloc[-1]
+    if ma == 0:
+        return np.nan
+    return (last - ma) / ma * 100.0
 
 # All metric functions accept a single-column price series for one ticker
 # and return a scalar float.
@@ -61,11 +75,11 @@ def pct_above_200dma(prices: pd.Series) -> float:
 
 def return_skewness(prices: pd.Series) -> float:
     rets = prices.pct_change().dropna()
-    return float(skew(rets)) if len(rets)>3 else np.nan
+    return float(rets.skew()) if len(rets)>3 else np.nan
 
 def return_kurtosis(prices: pd.Series) -> float:
     rets = prices.pct_change().dropna()
-    return float(kurtosis(rets, fisher=True)) if len(rets)>3 else np.nan
+    return float(rets.kurt()) if len(rets)>3 else np.nan
 
 def bollinger_bandwidth_20(prices: pd.Series) -> float:
     ma = prices.rolling(20).mean()
@@ -83,7 +97,7 @@ METRICS = {
     "CAGR": cagr,
     "Downside Deviation": downside_deviation,
     "Sortino Ratio": sortino,
-    "RSI(14)": rsi_14,
+    "RSI_14": rsi_14,
     "% Above 50DMA": pct_above_50dma,
     "% Above 200DMA": pct_above_200dma,
     "Return Skewness": return_skewness,

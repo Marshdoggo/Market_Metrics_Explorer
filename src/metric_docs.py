@@ -6,7 +6,7 @@ SYMMETRIC_PAIRS = {
     ("Mean Daily Return", "Daily Volatility (Std)"),
     ("Annualized Sharpe", "Max Drawdown"),
     ("Sortino Ratio", "Downside Deviation"),
-    ("RSI(14)", "Bollinger Bandwidth (20)"),
+    ("RSI_14", "Bollinger Bandwidth (20)"),
     ("% Above 50DMA", "Bollinger Bandwidth (20)"),
     ("% Above 200DMA", "Mean Daily Return"),
     ("Return Skewness", "Return Kurtosis (Fisher)"),
@@ -70,10 +70,15 @@ METRIC_META: Dict[str, Dict[str, str]] = {
         "desc": "Return / downside deviation (annualized).",
         "insight": "Reward per unit of bad-vol; higher is better.",
     },
-    "RSI(14)": {
+    "RSI_14": {
         "role": "oscillator",
         "desc": "Overbought/oversold oscillator (0–100).",
         "insight": "High = overbought risk; low = oversold risk.",
+    },
+    "RSI_14_Percentile_1Y": {
+        "role": "oscillator",
+        "desc": "Current RSI percentile versus the ticker's own trailing one-year RSI history.",
+        "insight": "Low values indicate RSI is depressed relative to that asset's recent regime.",
     },
     "% Above 50DMA": {
         "role": "trend_level_50",
@@ -100,6 +105,91 @@ METRIC_META: Dict[str, Dict[str, str]] = {
         "desc": "Relative band width (Upper−Lower)/Middle.",
         "insight": "Low BW = squeeze; high BW = expansion/trend.",
     },
+    "Distance_50DMA": {
+        "role": "trend_level_50",
+        "desc": "Percent distance from the 50-day moving average.",
+        "insight": "Positive values are above the medium-term trend; extremes can be stretched.",
+    },
+    "Distance_200DMA": {
+        "role": "trend_level_200",
+        "desc": "Percent distance from the 200-day moving average.",
+        "insight": "Positive values usually indicate a healthier long-term trend regime.",
+    },
+    "SMA_50_200_Spread": {
+        "role": "trend_level_200",
+        "desc": "Percent spread between the 50-day and 200-day simple moving averages.",
+        "insight": "Positive spread supports trend continuation; negative spread flags deterioration.",
+    },
+    "Drawdown_3M_High": {
+        "role": "risk_path",
+        "desc": "Latest percent drawdown from the trailing 3-month high.",
+        "insight": "More negative values show a deeper pullback from recent highs.",
+    },
+    "Drawdown_1Y_High": {
+        "role": "risk_path",
+        "desc": "Latest percent drawdown from the trailing one-year high.",
+        "insight": "Shows how far price is below its longer-term high-water mark.",
+    },
+    "Days_Since_3M_High": {
+        "role": "trend_level_50",
+        "desc": "Trading days since the trailing 3-month high occurred.",
+        "insight": "Large values suggest stale momentum; zero means the ticker is at a fresh 3-month high.",
+    },
+    "Return_20D": {
+        "role": "return",
+        "desc": "Percent price return over the last 20 trading days.",
+        "insight": "Short swing momentum snapshot.",
+    },
+    "Return_60D": {
+        "role": "return",
+        "desc": "Percent price return over the last 60 trading days.",
+        "insight": "Mid-term swing momentum snapshot.",
+    },
+    "Realized_Vol_20D": {
+        "role": "risk_vol",
+        "desc": "Annualized realized volatility from the last 20 daily returns, in percent.",
+        "insight": "High readings can make signals harder to trade cleanly.",
+    },
+    "ATR_14_Pct": {
+        "role": "risk_vol",
+        "desc": "Average true range over 14 days as a percent of latest close when high/low data is available.",
+        "insight": "Higher values indicate larger recent trading ranges.",
+    },
+    "Bollinger_PctB_20D": {
+        "role": "oscillator",
+        "desc": "Position of latest price within 20-day Bollinger Bands.",
+        "insight": "Near 0 is lower band pressure; near 1 is upper band pressure.",
+    },
+    "ZScore_20D": {
+        "role": "oscillator",
+        "desc": "Latest price z-score versus the trailing 20-day mean and standard deviation.",
+        "insight": "Positive values are above recent mean; negative values are below it.",
+    },
+    "Volume_Ratio_20D_60D": {
+        "role": "range_vol",
+        "desc": "Average volume over 20 days divided by average volume over 60 days when volume is available.",
+        "insight": "Values above 1 suggest volume expansion.",
+    },
+    "Down_Day_Volume_Ratio_20D": {
+        "role": "range_vol",
+        "desc": "Average volume on down days divided by all-day average volume over 20 days.",
+        "insight": "Higher readings can indicate heavier selling pressure.",
+    },
+    "Dip_Buy_Score": {
+        "role": "risk_adj",
+        "desc": "Universe-relative score for strong prior performers that are pulled back but not structurally broken.",
+        "insight": "Higher scores are better dip-buy candidates within the selected universe.",
+    },
+    "Bear_Breakdown_Score": {
+        "role": "risk_path",
+        "desc": "Universe-relative score for deteriorating trend and momentum conditions.",
+        "insight": "Higher scores flag stronger bearish or short-breakdown candidates.",
+    },
+    "Momentum_Continuation_Score": {
+        "role": "return",
+        "desc": "Universe-relative score for persistent upside trend and momentum continuation.",
+        "insight": "Higher scores favor stronger continuation setups within the selected universe.",
+    },
 }
 
 # --- Quadrant guides --------------------------------------------------------
@@ -123,7 +213,7 @@ PAIR_GUIDES: Dict[Tuple[str, str], Dict[str, str]] = {
         "BR": "High Sortino • Low downside dev → Excellent quality of returns.",
         "BL": "Low Sortino • Low downside dev → Calm but underperforming.",
     },
-    ("RSI(14)", "Bollinger Bandwidth (20)"): {
+    ("RSI_14", "Bollinger Bandwidth (20)"): {
         "TR": "High RSI • High BW → Overbought with expansion (blow-off risk).",
         "TL": "Low RSI • High BW → Oversold with expansion (capitulation risk).",
         "BR": "High RSI • Low BW → Tight overbought coil (watch fade).",

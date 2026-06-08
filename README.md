@@ -40,6 +40,8 @@ Current supported universes include:
 
 - Integrated AI-assisted chart interpretation
 
+- Technical signal metrics for dip-buy, bearish breakdown, and momentum-continuation research
+
 ---
 
 ## Example Questions
@@ -55,6 +57,26 @@ The platform is designed to help answer questions such as:
 - How does a company's position change when the lookback period changes?
 
 - What relationships exist between return, drawdown, volatility, and Sharpe ratio?
+
+- Which assets are pulled back from recent highs while still holding longer-term trend support?
+
+- Which assets show weakening mid-term momentum and trend breakdown risk?
+
+- Which assets show persistent upside momentum with volume confirmation?
+
+---
+
+## Technical Signal Metrics
+
+Market Metrics Explorer includes an exploratory technical layer for swing-trading research. These indicators and scores are not financial advice and should be treated as universe-relative screening tools, not absolute predictions.
+
+- `Dip_Buy_Score` attempts to identify assets with strong prior/risk-adjusted performance that are currently pulled back but not structurally broken.
+
+- `Bear_Breakdown_Score` attempts to identify assets with deteriorating trend, momentum, and selling-pressure conditions.
+
+- `Momentum_Continuation_Score` attempts to identify assets with persistent upside trend and momentum.
+
+Scores are scaled from 0 to 100 using cross-sectional percentile ranks inside the selected universe. Close-only datasets populate close-based metrics; high/low/volume metrics such as ATR percent and volume ratios are left blank when those fields are unavailable.
 
 ---
 

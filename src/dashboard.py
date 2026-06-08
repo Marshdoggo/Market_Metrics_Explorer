@@ -15,11 +15,9 @@ import pandas as pd
 import json
 import requests
 import hashlib
+import re
 from datetime import date
 from pathlib import Path
-import matplotlib.pyplot as plt
-from scipy.cluster.hierarchy import linkage, dendrogram
-from scipy.spatial.distance import squareform
 
 from fetch_data import get_sp500_constituents, get_meta
 from compute_metrics import compute_all_metrics
@@ -35,15 +33,8 @@ from leaderboards import (
     snapshot_path as leaderboard_snapshot_path,
 )
 from metric_docs import METRIC_META, get_pair_guide
-from plot_metrics import scatter_xy
 from universes import get_universe
 from local_pipeline import VALID_SOURCES, local_pipeline_ui_enabled, run_pipeline
-
-
-
-
-from utils import parse_tickers
-
 # --- AI helpers (chat + context) -----------------------------------------------
 from ai_context import (
     get_openai_client,
@@ -121,6 +112,17 @@ def _safe_date_bounds(prices):
     return (today - pd.Timedelta(days=365)).date(), today.date()
 
 
+def parse_tickers(text: str) -> list[str]:
+    if not text:
+        return []
+    cleaned = []
+    for raw in re.split(r"[\s,]+", text):
+        ticker = raw.strip().upper().lstrip("$").replace("/", "").replace("-", "")
+        if ticker:
+            cleaned.append(ticker)
+    return list(dict.fromkeys(cleaned))
+
+
 @st.cache_data(ttl=5*60)
 def _load_leaderboard_history(universe: str, lookback: int, cache_key: str) -> pd.DataFrame:
     local_data_repo = os.environ.get("MKTME_DATA_REPO", os.path.join(PROJECT_ROOT, "mktme-data"))
@@ -135,6 +137,11 @@ def _load_leaderboard_history(universe: str, lookback: int, cache_key: str) -> p
 st.set_page_config(page_title='S&P 500 Metric Explorer', layout='wide')
 
 st.title('📈 Market Metric Explorer')
+
+if "highlight_tickers" not in st.session_state:
+    st.session_state["highlight_tickers"] = ""
+if st.session_state.get("pending_highlight_tickers"):
+    st.session_state["highlight_tickers"] = st.session_state.pop("pending_highlight_tickers")
 
 health = build_dashboard_health()
 health_state = health.get("state")
@@ -241,7 +248,11 @@ with st.sidebar:
                             if combined_output:
                                 st.text_area("Pipeline output", combined_output[-10000:], height=260)
     interactive = st.checkbox('Interactive chart (Plotly)', value=True)
-    query = st.text_input('Highlight tickers (comma-separated)', value='', placeholder='AAPL, MSFT, NVDA  •  or  EURUSD, USDJPY')
+    query = st.text_input(
+        'Highlight tickers (comma-separated)',
+        key='highlight_tickers',
+        placeholder='AAPL, MSFT, NVDA  •  or  EURUSD, USDJPY',
+    )
     st.caption('Data by Wikipedia (equities) and local publisher → Parquet (served via GitHub Raw).')
 
 if universe == 'sp500':
@@ -367,23 +378,126 @@ def build_metrics_df(prices_full: pd.DataFrame, asof_ts_local: pd.Timestamp) -> 
     return df
 
 
+highlight = parse_tickers(query)
+
+# Build A (and B if needed) before selectors so every numeric technical metric
+# is available in the manual dropdowns.
+metrics_df_A = build_metrics_df(prices, asof_ts)
+metrics_df = metrics_df_A  # keep old name for downstream references when not comparing
+metrics_df_B = build_metrics_df(prices, asof2_ts) if compare and asof2_ts is not None else None
+
+def _numeric_metric_options(df: pd.DataFrame) -> list[str]:
+    skip = {"Ticker_upper", "IsHighlighted"}
+    cols = []
+    for col in df.columns:
+        if col in skip:
+            continue
+        if pd.api.types.is_numeric_dtype(df[col]):
+            cols.append(col)
+    preferred = [
+        "Annualized Sharpe",
+        "Sortino Ratio",
+        "CAGR",
+        "Max Drawdown",
+        "Daily Volatility (Std)",
+        "RSI_14",
+        "Dip_Buy_Score",
+        "Bear_Breakdown_Score",
+        "Momentum_Continuation_Score",
+    ]
+    return [m for m in preferred if m in cols] + [m for m in cols if m not in preferred]
 
 
-# Gather user metric choices (applies to both A and B)
-col1, col2, col3 = st.columns([1,1,1])
-with col1:
-    x_metric = st.selectbox('X axis', list(METRICS.keys()), index=1)
-with col2:
-    y_metric = st.selectbox('Y axis', list(METRICS.keys()), index=0)
-with col3:
-    color_options = ['Sector','SubIndustry','(None)'] if universe != 'fx' else ['SubIndustry','(None)']
-    color_by = st.selectbox('Color by', color_options)
-    if color_by == '(None)':
-        color_by = None
+def _first_available(candidates: list[str], options: list[str], fallback: str | None = None) -> str:
+    for candidate in candidates:
+        if candidate in options:
+            return candidate
+    return fallback if fallback in options else (options[0] if options else "")
+
+
+numeric_metrics = _numeric_metric_options(metrics_df_A)
+default_x = _first_available(["Sortino Ratio", "Annualized Sharpe"], numeric_metrics)
+default_y = _first_available(["Annualized Sharpe", "Sortino Ratio"], numeric_metrics, default_x)
+default_size = "(None)"
+default_color = "Sector" if universe != "fx" else "SubIndustry"
+
+
+def _option_index(options: list[str], value: str) -> int:
+    return options.index(value) if value in options else 0
+
+
+def _plotly_marker_sizes(df: pd.DataFrame, size_col: str | None) -> pd.Series | None:
+    if not size_col or size_col not in df.columns:
+        return None
+    values = pd.to_numeric(df[size_col], errors='coerce')
+    if 'Drawdown' in size_col:
+        values = values.abs()
+    ranks = values.rank(pct=True)
+    return ranks.fillna(0.0).mul(38).add(7)
+
+
+def _interactive_scatter(
+    df: pd.DataFrame,
+    *,
+    x: str,
+    y: str,
+    title: str,
+    color_col: str | None,
+    size_col: str | None,
+):
+    import plotly.express as px
+
+    plot_df = df.copy()
+    marker_size_col = None
+    if size_col and size_col in plot_df.columns:
+        marker_size_col = '_MarkerSize'
+        plot_df[marker_size_col] = _plotly_marker_sizes(plot_df, size_col)
+
+    hover_data = {}
+    for col in ['Ticker', 'Name', 'Sector', 'SubIndustry']:
+        if col in plot_df.columns:
+            hover_data[col] = True
+    if size_col and size_col in plot_df.columns:
+        hover_data[size_col] = True
+    if color_col and color_col in plot_df.columns and color_col not in hover_data:
+        hover_data[color_col] = True
+    if marker_size_col:
+        hover_data[marker_size_col] = False
+
+    fig = px.scatter(
+        plot_df,
+        x=x,
+        y=y,
+        color=color_col if color_col in plot_df.columns else None,
+        size=marker_size_col,
+        size_max=45,
+        hover_name='Ticker' if 'Ticker' in plot_df.columns else None,
+        hover_data=hover_data if hover_data else None,
+        title=title,
+    )
+    if marker_size_col:
+        fig.update_traces(marker=dict(opacity=0.85))
+    else:
+        fig.update_traces(marker=dict(size=8, opacity=0.85))
+    fig.update_layout(legend_title_text=color_col or '')
+    return fig
+
 
 with st.sidebar:
     st.markdown('---')
     st.header('Chart View')
+    enable_color_metric = st.checkbox(
+        'Enable color metric',
+        value=False,
+        key='main_enable_color_metric',
+        help='Adds an optional color dimension to the main scatter.'
+    )
+    enable_size_metric = st.checkbox(
+        'Enable dot size metric',
+        value=False,
+        key='main_enable_size_metric',
+        help='Adds an optional percentile-normalized marker size dimension.'
+    )
     axis_focus_pct = st.slider(
         'Axis focus (%)',
         min_value=60,
@@ -410,6 +524,43 @@ with st.sidebar:
         value=False,
         help='Uses a logarithmic Y axis when all plotted Y values are positive.'
     )
+
+# Gather user metric choices (applies to both A and B)
+col1, col2 = st.columns([1,1])
+with col1:
+    x_metric = st.selectbox('X axis', numeric_metrics, index=_option_index(numeric_metrics, default_x))
+with col2:
+    y_metric = st.selectbox('Y axis', numeric_metrics, index=_option_index(numeric_metrics, default_y))
+
+color_by = None
+size_metric = None
+if enable_color_metric and enable_size_metric:
+    col3, col4 = st.columns([1,1])
+elif enable_color_metric or enable_size_metric:
+    col3 = st.container()
+    col4 = None
+else:
+    col3 = col4 = None
+
+if enable_color_metric:
+    color_options = ['Sector','SubIndustry','(None)'] if universe != 'fx' else ['SubIndustry','(None)']
+    color_options = [c for c in color_options if c == '(None)' or c in metrics_df_A.columns] + [
+        m for m in numeric_metrics if m not in {'Sector', 'SubIndustry'}
+    ]
+    with col3:
+        color_by = st.selectbox('Color by', color_options, index=_option_index(color_options, default_color))
+        if color_by == '(None)':
+            color_by = None
+
+if enable_size_metric:
+    size_options = ['(None)'] + numeric_metrics
+    with (col4 if col4 is not None else col3):
+        size_metric = st.selectbox('Dot size', size_options, index=_option_index(size_options, default_size))
+        if size_metric == '(None)':
+            size_metric = None
+
+if not enable_color_metric and not enable_size_metric:
+    st.caption('Showing a two-axis scatter. Enable color or dot size in the sidebar for additional dimensions.')
 
 # --- Metric docs & quadrant guide -------------------------------------------------
 with st.expander('🧭 How to read this view (metric docs + quadrant guide)', expanded=False):
@@ -445,13 +596,6 @@ with st.expander('🧭 How to read this view (metric docs + quadrant guide)', ex
 """
     )
 
-highlight = parse_tickers(query)
-
-# Build A (and B if needed)
-metrics_df_A = build_metrics_df(prices, asof_ts)
-metrics_df = metrics_df_A  # keep old name for downstream references when not comparing
-metrics_df_B = build_metrics_df(prices, asof2_ts) if compare and asof2_ts is not None else None
-
 def _compute_axis_ranges(df_local: pd.DataFrame, x: str, y: str, focus_pct: int, padding_pct: int):
     sx = pd.to_numeric(df_local[x], errors='coerce').dropna()
     sy = pd.to_numeric(df_local[y], errors='coerce').dropna()
@@ -482,6 +626,9 @@ def _compute_axis_ranges(df_local: pd.DataFrame, x: str, y: str, focus_pct: int,
 def render_view(title_label: str, metrics_df_local: pd.DataFrame, axis_ranges=None):
     # Plot
     cols_needed = [x_metric, y_metric, 'Sector', 'SubIndustry', 'Ticker', 'Name', 'Ticker_upper', 'IsHighlighted']
+    for optional_col in [color_by, size_metric]:
+        if optional_col:
+            cols_needed.append(optional_col)
     present = [c for c in cols_needed if c in metrics_df_local.columns]
     missing_xy = [c for c in [x_metric, y_metric] if c not in metrics_df_local.columns]
 
@@ -495,9 +642,15 @@ def render_view(title_label: str, metrics_df_local: pd.DataFrame, axis_ranges=No
     can_log_x = bool((plot_df_local[x_metric] > 0).all()) if not plot_df_local.empty else False
     can_log_y = bool((plot_df_local[y_metric] > 0).all()) if not plot_df_local.empty else False
     if interactive:
-        from plot_metrics import scatter_xy_interactive
         import plotly.express as px
-        fig = scatter_xy_interactive(plot_df_local, x=x_metric, y=y_metric, title=f"{y_metric} vs {x_metric}")
+        fig = _interactive_scatter(
+            plot_df_local,
+            x=x_metric,
+            y=y_metric,
+            title=f"{y_metric} vs {x_metric}",
+            color_col=color_by,
+            size_col=size_metric,
+        )
         # Apply synced axis ranges if provided
         if axis_ranges is not None:
             if 'x' in axis_ranges and axis_ranges['x'] is not None:
@@ -520,9 +673,9 @@ def render_view(title_label: str, metrics_df_local: pd.DataFrame, axis_ranges=No
                     hi,
                     x=x_metric,
                     y=y_metric,
-                    color='Sector' if 'Sector' in hi.columns else None,
+                    color=color_by if color_by in hi.columns else None,
                     hover_name='Ticker',
-                    hover_data={c: True for c in ['Name','Sector','SubIndustry'] if c in hi.columns},
+                    hover_data={c: True for c in ['Name','Sector','SubIndustry', size_metric] if c and c in hi.columns},
                 )
                 fig_hi.update_traces(marker=dict(size=12, symbol='diamond', opacity=0.95, line=dict(width=1)))
                 for tr in fig_hi.data:
@@ -574,21 +727,55 @@ def render_view(title_label: str, metrics_df_local: pd.DataFrame, axis_ranges=No
 """
             )
     else:
-        fig, ax = scatter_xy(plot_df_local, x=x_metric, y=y_metric, color_by=(color_by or ''), title=f"{y_metric} vs {x_metric}")
-        if axis_ranges is not None:
-            if 'x' in axis_ranges and axis_ranges['x'] is not None:
-                ax.set_xlim(axis_ranges['x'])
-            if 'y' in axis_ranges and axis_ranges['y'] is not None:
-                ax.set_ylim(axis_ranges['y'])
-        if log_x and can_log_x:
-            ax.set_xscale('log')
-        elif log_x and not can_log_x:
-            st.caption(f'Log scale unavailable for X because {x_metric} includes zero or negative values in this view.')
-        if log_y and can_log_y:
-            ax.set_yscale('log')
-        elif log_y and not can_log_y:
-            st.caption(f'Log scale unavailable for Y because {y_metric} includes zero or negative values in this view.')
-        st.pyplot(fig)
+        try:
+            from plot_metrics import scatter_xy
+            fig, ax = scatter_xy(
+                plot_df_local,
+                x=x_metric,
+                y=y_metric,
+                color_by=(color_by or ''),
+                title=f"{y_metric} vs {x_metric}",
+                size_metric=size_metric,
+            )
+            if axis_ranges is not None:
+                if 'x' in axis_ranges and axis_ranges['x'] is not None:
+                    ax.set_xlim(axis_ranges['x'])
+                if 'y' in axis_ranges and axis_ranges['y'] is not None:
+                    ax.set_ylim(axis_ranges['y'])
+            if log_x and can_log_x:
+                ax.set_xscale('log')
+            elif log_x and not can_log_x:
+                st.caption(f'Log scale unavailable for X because {x_metric} includes zero or negative values in this view.')
+            if log_y and can_log_y:
+                ax.set_yscale('log')
+            elif log_y and not can_log_y:
+                st.caption(f'Log scale unavailable for Y because {y_metric} includes zero or negative values in this view.')
+            st.pyplot(fig)
+        except Exception as exc:
+            st.caption(f"Static chart unavailable ({type(exc).__name__}); using the interactive Plotly chart instead.")
+            import plotly.express as px
+            fig = _interactive_scatter(
+                plot_df_local,
+                x=x_metric,
+                y=y_metric,
+                title=f"{y_metric} vs {x_metric}",
+                color_col=color_by,
+                size_col=size_metric,
+            )
+            if axis_ranges is not None:
+                if 'x' in axis_ranges and axis_ranges['x'] is not None:
+                    fig.update_xaxes(range=axis_ranges['x'])
+                if 'y' in axis_ranges and axis_ranges['y'] is not None:
+                    fig.update_yaxes(range=axis_ranges['y'])
+            if log_x and can_log_x:
+                fig.update_xaxes(type='log')
+            elif log_x and not can_log_x:
+                st.caption(f'Log scale unavailable for X because {x_metric} includes zero or negative values in this view.')
+            if log_y and can_log_y:
+                fig.update_yaxes(type='log')
+            elif log_y and not can_log_y:
+                st.caption(f'Log scale unavailable for Y because {y_metric} includes zero or negative values in this view.')
+            st.plotly_chart(fig, use_container_width=True)
 
     # Selected vs Peers (for this view)
     st.markdown('#### Selected vs Peers')
@@ -629,9 +816,10 @@ def render_view(title_label: str, metrics_df_local: pd.DataFrame, axis_ranges=No
 
     # Data table for this view
     st.markdown('#### Data Table')
-    table_local = metrics_df_local.sort_values(by=y_metric, ascending=False)
+    table_sort_metric = y_metric
+    table_local = metrics_df_local.sort_values(by=table_sort_metric, ascending=False)
     if highlight:
-        table_local = table_local.sort_values(by=['IsHighlighted', y_metric], ascending=[False, False])
+        table_local = table_local.sort_values(by=['IsHighlighted', table_sort_metric], ascending=[False, False])
     st.dataframe(table_local.drop(columns=['Ticker_upper'], errors='ignore'))
 
 # Compute shared axis ranges if requested
@@ -937,6 +1125,200 @@ else:
             load_history=_load_leaderboard_history,
         )
 
+# --- Technical signals ----------------------------------------------------------
+st.markdown('---')
+st.subheader('Technical Signals')
+st.caption(
+    "Exploratory technical indicators only; scores are universe-relative and are not financial advice."
+)
+
+tech_preset = st.selectbox(
+    'Technical signal preset',
+    ['Manual', 'Dip Buy Candidates', 'Bear / Short Breakdown', 'Momentum Continuation'],
+    index=0,
+    key='technical_signal_preset',
+    help='Applies defaults to the technical signal chart without changing the main explorer.'
+)
+
+tech_default_x = _first_available(["RSI_14"], numeric_metrics, default_x)
+tech_default_y = _first_available(["Annualized Sharpe", "Sortino Ratio"], numeric_metrics, default_y)
+tech_default_size = _first_available(["Drawdown_3M_High"], numeric_metrics, "(None)")
+tech_default_color = _first_available(["Distance_200DMA", "Return_60D"], numeric_metrics, "(None)")
+
+if tech_preset == 'Bear / Short Breakdown':
+    tech_default_x = _first_available(["Return_60D"], numeric_metrics, tech_default_x)
+    tech_default_y = _first_available(["Distance_200DMA"], numeric_metrics, tech_default_y)
+    tech_default_size = _first_available(["ATR_14_Pct", "Realized_Vol_20D"], numeric_metrics, "(None)")
+    tech_default_color = _first_available(["RSI_14"], numeric_metrics, "(None)")
+elif tech_preset == 'Momentum Continuation':
+    tech_default_x = _first_available(["Return_20D"], numeric_metrics, tech_default_x)
+    tech_default_y = _first_available(["Return_60D"], numeric_metrics, tech_default_y)
+    tech_default_size = _first_available(["Volume_Ratio_20D_60D"], numeric_metrics, "(None)")
+    tech_default_color = _first_available(["RSI_14"], numeric_metrics, "(None)")
+
+tc1, tc2 = st.columns([1, 1])
+with tc1:
+    tech_x_metric = st.selectbox(
+        'Technical X axis',
+        numeric_metrics,
+        index=_option_index(numeric_metrics, tech_default_x),
+        key='technical_x_metric',
+    )
+with tc2:
+    tech_y_metric = st.selectbox(
+        'Technical Y axis',
+        numeric_metrics,
+        index=_option_index(numeric_metrics, tech_default_y),
+        key='technical_y_metric',
+    )
+
+td1, td2 = st.columns([1, 1])
+with td1:
+    tech_enable_color = st.checkbox('Enable technical color metric', value=False, key='technical_enable_color')
+with td2:
+    tech_enable_size = st.checkbox('Enable technical dot size metric', value=False, key='technical_enable_size')
+
+tech_color_metric = None
+tech_size_metric = None
+if tech_enable_color and tech_enable_size:
+    td3, td4 = st.columns([1, 1])
+elif tech_enable_color or tech_enable_size:
+    td3 = st.container()
+    td4 = None
+else:
+    td3 = td4 = None
+
+if tech_enable_color:
+    tech_color_options = ['(None)'] + numeric_metrics
+    with td3:
+        tech_color_metric = st.selectbox(
+            'Technical color by',
+            tech_color_options,
+            index=_option_index(tech_color_options, tech_default_color),
+            key='technical_color_metric',
+        )
+        if tech_color_metric == '(None)':
+            tech_color_metric = None
+
+if tech_enable_size:
+    tech_size_options = ['(None)'] + numeric_metrics
+    with (td4 if td4 is not None else td3):
+        tech_size_metric = st.selectbox(
+            'Technical dot size',
+            tech_size_options,
+            index=_option_index(tech_size_options, tech_default_size),
+            key='technical_size_metric',
+        )
+        if tech_size_metric == '(None)':
+            tech_size_metric = None
+
+if not tech_enable_color and not tech_enable_size:
+    st.caption('Showing a two-axis technical scatter. Enable color or dot size for additional dimensions.')
+
+tech_cols_needed = [tech_x_metric, tech_y_metric, 'Ticker', 'Name', 'Sector', 'SubIndustry', 'Ticker_upper', 'IsHighlighted']
+for optional_col in [tech_color_metric, tech_size_metric]:
+    if optional_col:
+        tech_cols_needed.append(optional_col)
+tech_present = [c for c in tech_cols_needed if c in metrics_df_A.columns]
+tech_missing_xy = [c for c in [tech_x_metric, tech_y_metric] if c not in metrics_df_A.columns]
+if tech_missing_xy:
+    st.warning(f"Selected technical metric(s) not available: {', '.join(tech_missing_xy)}.")
+else:
+    tech_plot_df = metrics_df_A[tech_present].dropna(subset=[tech_x_metric, tech_y_metric])
+    tech_fig = _interactive_scatter(
+        tech_plot_df,
+        x=tech_x_metric,
+        y=tech_y_metric,
+        title=f"{tech_y_metric} vs {tech_x_metric}",
+        color_col=tech_color_metric,
+        size_col=tech_size_metric,
+    )
+    if highlight:
+        import plotly.express as px
+        tech_fig.update_traces(marker=dict(opacity=0.35))
+        tech_hi = tech_plot_df[tech_plot_df['IsHighlighted']]
+        if not tech_hi.empty:
+            tech_fig_hi = px.scatter(
+                tech_hi,
+                x=tech_x_metric,
+                y=tech_y_metric,
+                color=tech_color_metric if tech_color_metric in tech_hi.columns else None,
+                hover_name='Ticker',
+                hover_data={c: True for c in ['Name', 'Sector', 'SubIndustry', tech_size_metric] if c and c in tech_hi.columns},
+            )
+            tech_fig_hi.update_traces(marker=dict(size=12, symbol='diamond', opacity=0.95, line=dict(width=1)))
+            for tr in tech_fig_hi.data:
+                tech_fig.add_trace(tr)
+    st.plotly_chart(tech_fig, use_container_width=True)
+
+st.markdown('#### Technical Signal Leaderboards')
+
+
+def _technical_rank_table(
+    df: pd.DataFrame,
+    sort_col: str,
+    *,
+    ascending: bool,
+    support_cols: list[str],
+    n: int = 10,
+) -> pd.DataFrame:
+    if sort_col not in df.columns:
+        return pd.DataFrame()
+    out = df.copy()
+    out[sort_col] = pd.to_numeric(out[sort_col], errors='coerce')
+    out = out.dropna(subset=[sort_col])
+    if out.empty:
+        return pd.DataFrame()
+    out = out.sort_values(sort_col, ascending=ascending).head(int(n)).copy()
+    out.insert(0, "Rank", range(1, len(out) + 1))
+    cols = ["Rank", "Ticker", "Name", "Sector", sort_col] + [
+        c for c in support_cols if c in out.columns and c != sort_col
+    ]
+    return out[[c for c in cols if c in out.columns]]
+
+
+technical_leaderboards = [
+    (
+        "Top Dip Buy Score",
+        "Dip_Buy_Score",
+        False,
+        ["RSI_14", "Drawdown_3M_High", "Distance_200DMA", "Annualized Sharpe", "Sortino Ratio"],
+    ),
+    (
+        "Top Bear Breakdown Score",
+        "Bear_Breakdown_Score",
+        False,
+        ["Return_20D", "Return_60D", "Distance_50DMA", "Distance_200DMA", "RSI_14", "ATR_14_Pct"],
+    ),
+    (
+        "Top Momentum Continuation Score",
+        "Momentum_Continuation_Score",
+        False,
+        ["Return_20D", "Return_60D", "Distance_50DMA", "SMA_50_200_Spread", "Volume_Ratio_20D_60D"],
+    ),
+    ("Most Oversold RSI", "RSI_14", True, ["Return_20D", "Drawdown_3M_High", "Distance_200DMA"]),
+    ("Largest Drawdown From 3M High", "Drawdown_3M_High", True, ["RSI_14", "Return_60D", "Distance_200DMA"]),
+    ("Highest Volume Surge", "Volume_Ratio_20D_60D", False, ["Return_20D", "Return_60D", "RSI_14"]),
+    ("Most Extended Above 50DMA", "Distance_50DMA", False, ["RSI_14", "Return_20D", "Return_60D"]),
+    ("Most Extended Below 50DMA", "Distance_50DMA", True, ["RSI_14", "Return_20D", "Return_60D"]),
+]
+
+for left, right in zip(technical_leaderboards[0::2], technical_leaderboards[1::2]):
+    c_left, c_right = st.columns(2)
+    for col_obj, config in [(c_left, left), (c_right, right)]:
+        title, metric, ascending, support = config
+        with col_obj:
+            st.markdown(f"#### {title}")
+            ranked = _technical_rank_table(metrics_df_A, metric, ascending=ascending, support_cols=support)
+            if ranked.empty:
+                st.caption(f"No rows available for {metric}.")
+            else:
+                board_tickers = ranked["Ticker"].dropna().astype(str).str.upper().tolist()
+                if st.button("Highlight on chart", key=f"technical_highlight_{metric}_{title}"):
+                    st.session_state["pending_highlight_tickers"] = ", ".join(board_tickers)
+                    st.rerun()
+                st.dataframe(ranked, use_container_width=True, hide_index=True)
+
 # --- Delta panel: compare highlighted tickers A → B ---
 if compare and metrics_df_B is not None and highlight:
     # Select highlighted rows from each snapshot
@@ -1010,20 +1392,28 @@ if highlight:
                 st.caption('Not enough valid price history for a correlation view.')
             else:
                 corr = rets.corr()
-                # Convert correlation to distance (1 - corr) and then to condensed form
-                dist = 1 - corr
-                # Ensure diagonals are zero and values finite
-                dist.values[range(len(dist)), range(len(dist))] = 0.0
-                dist_condensed = squareform(dist.values, checks=False)
+                try:
+                    from scipy.cluster.hierarchy import dendrogram, linkage
+                    from scipy.spatial.distance import squareform
+                except ImportError:
+                    st.caption('Install scipy to enable the highlighted-ticker correlation dendrogram.')
+                else:
+                    import matplotlib.pyplot as plt
 
-                Z = linkage(dist_condensed, method='average')
+                    # Convert correlation to distance (1 - corr) and then to condensed form
+                    dist = 1 - corr
+                    # Ensure diagonals are zero and values finite
+                    dist.values[range(len(dist)), range(len(dist))] = 0.0
+                    dist_condensed = squareform(dist.values, checks=False)
 
-                fig, ax = plt.subplots(figsize=(8, 4))
-                dendrogram(Z, labels=corr.columns.tolist(), leaf_rotation=90, ax=ax)
-                ax.set_ylabel('Distance (1 - correlation)')
-                ax.set_xlabel('Ticker')
-                fig.tight_layout()
-                st.pyplot(fig)
+                    Z = linkage(dist_condensed, method='average')
+
+                    fig, ax = plt.subplots(figsize=(8, 4))
+                    dendrogram(Z, labels=corr.columns.tolist(), leaf_rotation=90, ax=ax)
+                    ax.set_ylabel('Distance (1 - correlation)')
+                    ax.set_xlabel('Ticker')
+                    fig.tight_layout()
+                    st.pyplot(fig)
         except Exception as e:
             st.caption(f'Could not compute dendrogram: {e}')
 else:
@@ -1051,6 +1441,7 @@ def _stable_df_digest(df: pd.DataFrame) -> str:
         'Annualized Sharpe',
         'Daily Volatility (Std)',
         'Max Drawdown',
+        'RSI_14',
         'RSI(14)',
         'RSI(1)',
         'CAGR',
