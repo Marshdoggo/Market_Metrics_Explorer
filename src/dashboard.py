@@ -46,6 +46,7 @@ from ai_context import (
 from health_status import build_dashboard_health
 from status_store import list_recent_reports
 from forecast_lab.ui import render_forecast_lab
+from volatility_dashboard import render_volatility_dashboard
 # ------------------------------------------------------------------------------
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -176,6 +177,24 @@ with st.expander("Pipeline health details", expanded=False):
     if recent_runs:
         recent_df = pd.DataFrame(recent_runs)
         st.dataframe(recent_df, use_container_width=True, hide_index=True)
+
+with st.sidebar:
+    app_section = st.radio(
+        "App section",
+        ["Metric Explorer", "Volatility Dashboard"],
+        index=0,
+        key="app_section",
+    )
+
+if app_section == "Volatility Dashboard":
+    render_volatility_dashboard(
+        project_root=PROJECT_ROOT,
+        get_prices_for_universe=get_prices_for_universe,
+        get_sp500_constituents=get_sp500_constituents,
+        get_universe=get_universe,
+        compute_all_metrics=compute_all_metrics,
+    )
+    st.stop()
 
 with st.sidebar:
     st.header('Settings')

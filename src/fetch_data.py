@@ -43,6 +43,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 PRICES_PARQUET = os.path.join(DATA_DIR, "prices.parquet")
 FX_YF_PARQUET  = os.path.join(DATA_DIR, "fx_yf.parquet")
+VIX_TICKER = "^VIX"
+CBOE_VIX_HISTORY_URL = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
 SOURCE_CANARY_SYMBOLS = ["SPY", "AAPL", "MSFT"]
 _TWELVEDATA_CREDIT_HISTORY: deque[tuple[float, int]] = deque()
 
@@ -1052,6 +1054,97 @@ def download_prices_fx_window(
         pass
 
     return df
+
+
+def download_vix_data(period: str = "5y") -> pd.DataFrame:
+    """
+    Fetch VIX close history from yfinance.
+
+    Returns a DataFrame indexed by date with one column, VIX. This is intentionally
+    separate from the universe price pipeline because VIX is implied-volatility
+    market context, not an investable asset universe.
+    """
+    data = pd.DataFrame()
+    try:
+        try:
+            data = yf.download(
+                VIX_TICKER,
+                period=period,
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+                timeout=20,
+            )
+        except TypeError:
+            data = yf.download(
+                VIX_TICKER,
+                period=period,
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+            )
+    except Exception as exc:
+        _log(f"[fetch_data] yf.download VIX failed: {exc!r}")
+    if data is None or data.empty:
+        try:
+            data = yf.Ticker(VIX_TICKER).history(period=period, auto_adjust=False)
+        except Exception as exc:
+            _log(f"[fetch_data] yf.Ticker VIX history failed: {exc!r}")
+            data = pd.DataFrame()
+    if data is None or data.empty:
+        data = _download_cboe_vix_history(period=period)
+    if data is None or data.empty:
+        return pd.DataFrame(columns=["VIX"])
+
+    out = data.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [c[0] if isinstance(c, tuple) else c for c in out.columns]
+    close_col = "Close" if "Close" in out.columns else out.columns[0]
+    out = out[[close_col]].rename(columns={close_col: "VIX"})
+    out.index = pd.to_datetime(out.index, errors="coerce")
+    out = out.loc[~out.index.isna()].sort_index()
+    if getattr(out.index, "tz", None) is not None:
+        out.index = out.index.tz_localize(None)
+    return out.dropna(how="all")
+
+
+def _download_cboe_vix_history(period: str = "5y") -> pd.DataFrame:
+    try:
+        resp = requests.get(CBOE_VIX_HISTORY_URL, timeout=30)
+        resp.raise_for_status()
+        raw = pd.read_csv(io.StringIO(resp.text))
+    except Exception as exc:
+        _log(f"[fetch_data] Cboe VIX history failed: {exc!r}")
+        return pd.DataFrame(columns=["VIX"])
+    if raw.empty or "DATE" not in raw.columns or "CLOSE" not in raw.columns:
+        return pd.DataFrame(columns=["VIX"])
+
+    out = raw[["DATE", "CLOSE"]].copy()
+    out["DATE"] = pd.to_datetime(out["DATE"], errors="coerce")
+    out["CLOSE"] = pd.to_numeric(out["CLOSE"], errors="coerce")
+    out = out.dropna(subset=["DATE", "CLOSE"]).set_index("DATE").sort_index()
+    out = out.rename(columns={"CLOSE": "VIX"})
+    cutoff = _period_cutoff(period)
+    if cutoff is not None:
+        out = out[out.index >= cutoff]
+    return out
+
+
+def _period_cutoff(period: str) -> pd.Timestamp | None:
+    value = str(period or "").strip().lower()
+    if value in {"", "max"}:
+        return None
+    now = pd.Timestamp.utcnow().tz_localize(None).normalize()
+    try:
+        if value.endswith("mo"):
+            return now - pd.DateOffset(months=int(value[:-2]))
+        if value.endswith("y"):
+            return now - pd.DateOffset(years=int(value[:-1]))
+        if value.endswith("d"):
+            return now - pd.Timedelta(days=int(value[:-1]))
+    except Exception:
+        return None
+    return None
 
 # ---------------------- Meta (placeholder kept for API symmetry) ----------------------
 

@@ -18,7 +18,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from ai_report import generate_daily_report, save_report_json, save_report_markdown  # noqa: E402
-from fetch_data import download_prices, download_prices_fx_window, get_sp500_constituents  # noqa: E402
+from fetch_data import download_prices, download_prices_fx_window, download_vix_data, get_sp500_constituents  # noqa: E402
 from leaderboards import (  # noqa: E402
     append_snapshot_rows,
     build_leaderboard_snapshots,
@@ -176,6 +176,31 @@ def _write_prices_parquet(data_repo: Path, universe: str, prices: pd.DataFrame) 
     return rel_path, rel_path
 
 
+def _load_or_fetch_vix_data(*, data_repo: Path, force_refresh: bool, use_existing_parquet: bool) -> pd.DataFrame:
+    existing_path = data_repo / "market" / "vix.parquet"
+    if use_existing_parquet and existing_path.exists():
+        return _to_naive_dt_index(pd.read_parquet(existing_path))
+
+    fresh = _to_naive_dt_index(download_vix_data(period=os.environ.get("MKTME_VIX_PERIOD", "5y")))
+    if fresh.empty and existing_path.exists():
+        return _to_naive_dt_index(pd.read_parquet(existing_path))
+    if existing_path.exists() and not fresh.empty and not force_refresh:
+        try:
+            existing = _to_naive_dt_index(pd.read_parquet(existing_path))
+            fresh = fresh.combine_first(existing)
+        except Exception:
+            pass
+    return fresh
+
+
+def _write_market_data_parquet(data_repo: Path, name: str, df: pd.DataFrame) -> str:
+    out_dir = data_repo / "market"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{name}.parquet"
+    df.to_parquet(out_path, engine="pyarrow")
+    return f"market/{name}.parquet"
+
+
 def _latest_index_date(entries: list[dict[str, Any]]) -> str | None:
     dated: list[tuple[pd.Timestamp, str]] = []
     for entry in entries or []:
@@ -323,7 +348,12 @@ def _append_daily_leaderboard_snapshot(
     return out_path, added, history
 
 
-def _write_manifest(data_repo: Path, rel_paths: dict[str, str], github_user: str) -> dict[str, Any]:
+def _write_manifest(
+    data_repo: Path,
+    rel_paths: dict[str, str],
+    github_user: str,
+    market_rel_paths: dict[str, str] | None = None,
+) -> dict[str, Any]:
     base_url = f"https://raw.githubusercontent.com/{github_user}/mktme-data/main"
     manifest_path = data_repo / "manifest.json"
     if manifest_path.exists():
@@ -337,11 +367,15 @@ def _write_manifest(data_repo: Path, rel_paths: dict[str, str], github_user: str
     existing_universes = manifest.get("universes")
     if not isinstance(existing_universes, dict):
         existing_universes = {}
+    existing_market_data = manifest.get("market_data")
+    if not isinstance(existing_market_data, dict):
+        existing_market_data = {}
 
     manifest = {
         "generated_at": utc_now_iso(),
         "base_url": base_url,
         "universes": existing_universes,
+        "market_data": existing_market_data,
     }
     for prices_path in sorted(data_repo.glob("*/prices.parquet")):
         universe = prices_path.parent.name
@@ -350,6 +384,9 @@ def _write_manifest(data_repo: Path, rel_paths: dict[str, str], github_user: str
 
     for universe, rel_path in rel_paths.items():
         manifest["universes"][universe] = {"parquet_url": f"{base_url}/{rel_path}"}
+
+    for name, rel_path in (market_rel_paths or {}).items():
+        manifest["market_data"][name] = {"parquet_url": f"{base_url}/{rel_path}"}
 
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest
@@ -365,6 +402,7 @@ def run_publish(
     trigger_type: str,
     github_user: str,
     use_existing_parquet: bool,
+    include_vix: bool = True,
 ) -> None:
     init_db()
     run_id = start_pipeline_run(trigger_type=trigger_type, mode="legacy_publish", git_sha=_git_sha())
@@ -373,6 +411,7 @@ def run_publish(
     set_status("pipeline.last_error", None)
 
     rel_paths: dict[str, str] = {}
+    market_rel_paths: dict[str, str] = {}
     asof_dates: dict[str, str] = {}
 
     try:
@@ -468,7 +507,28 @@ def run_publish(
             )
             set_status(f"legacy.latest_report_date.{universe}", asof_dates[universe])
 
-        manifest = _write_manifest(data_repo, rel_paths, github_user=github_user)
+        if include_vix:
+            try:
+                vix = _load_or_fetch_vix_data(
+                    data_repo=data_repo,
+                    force_refresh=force_refresh,
+                    use_existing_parquet=use_existing_parquet,
+                )
+                if vix.empty:
+                    print("[market_data] VIX fetch returned no rows; skipping VIX artifact.", flush=True)
+                else:
+                    rel_path = _write_market_data_parquet(data_repo, "vix", vix)
+                    market_rel_paths["vix"] = rel_path
+                    vix_asof = pd.to_datetime(vix.index.max()).date().isoformat()
+                    set_status("market_data.vix_asof_date", vix_asof)
+                    set_status("market_data.vix_artifact_path", rel_path)
+                    print(f"[market_data] Wrote VIX artifact: {rel_path} ({vix_asof})", flush=True)
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                set_status("market_data.vix_error", message)
+                print(f"[market_data] VIX fetch failed; continuing without VIX artifact. {message}", flush=True)
+
+        manifest = _write_manifest(data_repo, rel_paths, github_user=github_user, market_rel_paths=market_rel_paths)
         reports_index = json.loads((data_repo / "reports" / "index.json").read_text(encoding="utf-8"))
         report_universes = reports_index.get("universes") or {}
         for universe, entries in report_universes.items():
@@ -489,6 +549,7 @@ def run_publish(
             "source_by_universe": source_by_universe,
             "latest_report_dates": asof_dates,
             "manifest_generated_at": manifest.get("generated_at"),
+            "published_market_data": sorted(market_rel_paths.keys()),
             "data_repo": str(data_repo),
             "used_existing_parquet": use_existing_parquet,
         }
@@ -512,6 +573,7 @@ def main() -> None:
     parser.add_argument("--trigger-type", default=os.environ.get("MKTME_PIPELINE_TRIGGER", "manual"))
     parser.add_argument("--force-refresh", action="store_true", default=os.environ.get("MKTME_FORCE_REFRESH", "").lower() in {"1", "true", "yes"})
     parser.add_argument("--use-existing-parquet", action="store_true")
+    parser.add_argument("--skip-vix", action="store_true", default=os.environ.get("MKTME_SKIP_VIX", "").lower() in {"1", "true", "yes"})
     parser.add_argument("--universes", nargs="+", default=["sp500"])
     parser.add_argument("--source-sp500", default=os.environ.get("MKTME_SOURCE_SP500", ""))
     parser.add_argument("--source-nasdaq100", default=os.environ.get("MKTME_SOURCE_NASDAQ100", ""))
@@ -528,6 +590,7 @@ def main() -> None:
         trigger_type=args.trigger_type,
         github_user=args.github_user,
         use_existing_parquet=bool(args.use_existing_parquet),
+        include_vix=not bool(args.skip_vix),
     )
 
 

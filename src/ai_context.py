@@ -16,9 +16,14 @@ from time import time
 
 import pandas as pd
 
-# SciPy is already in your project; used for clustering summary
-from scipy.cluster.hierarchy import linkage, fcluster
-from scipy.spatial.distance import squareform
+# SciPy is optional at runtime; when unavailable, only cluster summaries are skipped.
+try:
+    from scipy.cluster.hierarchy import linkage, fcluster
+    from scipy.spatial.distance import squareform
+except Exception:
+    linkage = None
+    fcluster = None
+    squareform = None
 
 # OpenAI SDK (optional at import-time)
 try:
@@ -222,6 +227,9 @@ def _summarize_clusters(
     NOTE: This is a summary of the same information your dendrogram visual encodes.
     """
     lines: List[str] = []
+    if linkage is None or fcluster is None or squareform is None:
+        return lines
+
     cols = [t for t in tickers_hi if t in prices.columns]
     if len(cols) < 2:
         return lines

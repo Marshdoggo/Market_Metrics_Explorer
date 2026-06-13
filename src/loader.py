@@ -50,3 +50,13 @@ def get_prices_for_universe(universe: str) -> pd.DataFrame:
         raise RuntimeError(f"Universe '{universe}' not present in manifest {MANIFEST_URL}")
     cache_key = str(m.get("generated_at") or "")
     return load_parquet_http(url, cache_key=cache_key)
+
+
+def get_market_data(name: str) -> pd.DataFrame:
+    m = _load_manifest()
+    try:
+        url = m["market_data"][name]["parquet_url"]
+    except Exception:
+        raise RuntimeError(f"Market data '{name}' not present in manifest {MANIFEST_URL}")
+    cache_key = str(m.get("generated_at") or "")
+    return load_parquet_http(url, cache_key=cache_key)

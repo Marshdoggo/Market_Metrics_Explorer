@@ -130,6 +130,7 @@ def run_publish_from_args(args: argparse.Namespace) -> None:
         trigger_type=args.trigger_type,
         github_user=args.github_user,
         use_existing_parquet=bool(args.use_existing_parquet),
+        include_vix=not bool(args.skip_vix),
     )
 
 
@@ -151,6 +152,7 @@ def main() -> None:
     parser.add_argument("--github-user", default=os.environ.get("MKTME_GITHUB_USER", "marshdoggo"))
     parser.add_argument("--force-refresh", action="store_true", default=os.environ.get("MKTME_FORCE_REFRESH", "").lower() in {"1", "true", "yes"})
     parser.add_argument("--use-existing-parquet", action="store_true")
+    parser.add_argument("--skip-vix", action="store_true", default=os.environ.get("MKTME_SKIP_VIX", "").lower() in {"1", "true", "yes"})
     parser.add_argument(
         "--universes",
         nargs="+",
