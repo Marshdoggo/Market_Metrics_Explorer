@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 import requests
 import yfinance as yf
+from fx_universe import pair_to_yahoo_symbol
 #import plotly
 try:
     # fallback price source
@@ -955,9 +956,7 @@ def download_prices(
 # ---------------------- FX windowed via yfinance (close) ----------------------
 
 def _fx_to_yf_symbol(pair: str) -> str:
-    # EURUSD -> EURUSD=X, USDJPY -> USDJPY=X
-    s = str(pair).strip().upper().replace("/", "")
-    return f"{s}=X"
+    return pair_to_yahoo_symbol(pair)
 
 
 def _download_yahoo_symbols(
@@ -1045,6 +1044,13 @@ def download_prices_fx_window(
     # Map back columns from 'EURUSD=X' -> 'EURUSD'
     colmap = {s: s.replace("=X","") for s in df.columns}
     df = df.rename(columns=colmap)
+    requested_pairs = {pair_to_yahoo_symbol(pair).replace("=X", "") for pair in pairs}
+    missing_pairs = sorted(requested_pairs - set(df.columns)) if not df.empty else sorted(requested_pairs)
+    if missing_pairs:
+        _log(
+            f"[fetch_data] FX pairs unavailable from {resolved_source} "
+            f"({len(missing_pairs)}): {missing_pairs[:30]}{' …' if len(missing_pairs) > 30 else ''}"
+        )
 
     # Also persist to an FX cache (optional)
     try:

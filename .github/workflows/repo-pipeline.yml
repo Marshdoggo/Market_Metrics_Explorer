@@ -34,6 +34,14 @@ on:
         description: "Reuse checked-out mktme-data parquet files instead of live refresh"
         required: false
         default: "false"
+      backfill_leaderboards:
+        description: "Backfill leaderboard history after publishing prices"
+        required: false
+        default: "false"
+      backfill_history_days:
+        description: "Number of recent price dates to backfill when enabled"
+        required: false
+        default: "252"
 
 concurrency:
   group: repo-pipeline-main
@@ -91,6 +99,8 @@ jobs:
             export MKTME_SOURCE_FX="${{ inputs.source_fx }}"
             UNIVERSES="${{ inputs.universes }}"
             USE_EXISTING_PARQUET="${{ inputs.use_existing_parquet }}"
+            BACKFILL_LEADERBOARDS="${{ inputs.backfill_leaderboards }}"
+            BACKFILL_HISTORY_DAYS="${{ inputs.backfill_history_days }}"
           else
             export MKTME_EQUITY_SOURCE="auto"
             export MKTME_SOURCE_SP500="twelvedata"
@@ -99,12 +109,24 @@ jobs:
             export MKTME_SOURCE_FX="alphavantage"
             UNIVERSES="sp500 nasdaq100 dow30 fx"
             USE_EXISTING_PARQUET="false"
+            BACKFILL_LEADERBOARDS="false"
+            BACKFILL_HISTORY_DAYS="252"
           fi
           EXTRA_ARGS=""
           if [ "${USE_EXISTING_PARQUET}" = "true" ]; then
             EXTRA_ARGS="${EXTRA_ARGS} --use-existing-parquet"
           fi
           python -m pipeline.publish_legacy_artifacts --universes ${UNIVERSES} ${EXTRA_ARGS}
+          if [ "${BACKFILL_LEADERBOARDS}" = "true" ]; then
+            for UNIVERSE in ${UNIVERSES}; do
+              python -m pipeline.backfill_leaderboards \
+                --data-repo "${MKTME_DATA_REPO}" \
+                --universe "${UNIVERSE}" \
+                --lookback "${MKTME_LOOKBACK:-252}" \
+                --history-days "${BACKFILL_HISTORY_DAYS}" \
+                --force
+            done
+          fi
 
       - name: Commit and push mktme-data
         env:

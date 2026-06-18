@@ -42,6 +42,11 @@ from status_store import (  # noqa: E402
     write_status_snapshot_json,
 )
 from universes import get_universe  # noqa: E402
+from fx_universe import FX_UNIVERSE_ALIASES  # noqa: E402
+
+
+def _is_fx_universe(universe: str) -> bool:
+    return str(universe).strip().lower().replace("-", "_") in FX_UNIVERSE_ALIASES
 
 
 def _git_sha() -> str | None:
@@ -96,12 +101,15 @@ def _normalize_source(raw: str | None, fallback: str) -> str:
 
 def _source_map_from_args(args: argparse.Namespace) -> dict[str, str]:
     fallback = _normalize_source(os.environ.get("MKTME_EQUITY_SOURCE"), "auto")
-    return {
+    sources = {
         "sp500": _normalize_source(args.source_sp500, fallback),
         "nasdaq100": _normalize_source(args.source_nasdaq100, fallback),
         "dow30": _normalize_source(args.source_dow30, fallback),
         "fx": _normalize_source(args.source_fx, fallback),
     }
+    for alias in FX_UNIVERSE_ALIASES:
+        sources[alias] = sources["fx"]
+    return sources
 
 
 def _load_or_fetch_prices(
@@ -120,7 +128,7 @@ def _load_or_fetch_prices(
         return _to_naive_dt_index(pd.read_parquet(existing_path))
 
     tickers = tickers_df["Ticker"].astype(str).tolist()
-    if universe == "fx":
+    if _is_fx_universe(universe):
         asof = pd.Timestamp.now(tz="UTC").normalize().tz_localize(None)
         fresh = _to_naive_dt_index(
             download_prices_fx_window(
@@ -154,6 +162,15 @@ def _load_or_fetch_prices(
 
 
 def _build_metrics(prices: pd.DataFrame, tickers_df: pd.DataFrame, lookback: int) -> pd.DataFrame:
+    expected = set(tickers_df["Ticker"].astype(str).str.upper())
+    available = set(str(c).upper() for c in prices.columns)
+    missing = sorted(expected - available)
+    if missing:
+        print(
+            f"[metrics] Skipping {len(missing)} unavailable symbols: "
+            f"{missing[:30]}{' ...' if len(missing) > 30 else ''}",
+            flush=True,
+        )
     if compute_all_metrics is not None:
         metrics_df = compute_all_metrics(prices, lookback=lookback)
     else:
@@ -276,6 +293,8 @@ def _write_report_artifacts(
         primary_rank_metric="Annualized Sharpe",
         top_n=5,
         leaderboard_context=leaderboard_context,
+        enable_llm_commentary=os.environ.get("MKTME_ENABLE_LLM_COMMENTARY", "").lower() in {"1", "true", "yes"},
+        llm_model=os.environ.get("MKTME_LLM_MODEL", "gpt-4.1-mini"),
     )
     daily.report["facts"] = daily.facts
     daily.report["run_utc"] = utc_now_iso()
@@ -423,7 +442,7 @@ def run_publish(
         prefetched_equity_prices: dict[str, pd.DataFrame] = {}
         grouped_tickers: dict[str, list[str]] = {}
         for universe in universes:
-            if universe == "fx":
+            if _is_fx_universe(universe):
                 continue
             source = source_by_universe.get(universe, "auto")
             grouped_tickers.setdefault(source, [])

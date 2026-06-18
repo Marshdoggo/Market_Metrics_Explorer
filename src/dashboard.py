@@ -34,6 +34,7 @@ from leaderboards import (
 )
 from metric_docs import METRIC_META, get_pair_guide
 from universes import get_universe
+from fx_universe import FX_UNIVERSE_ALIASES
 from local_pipeline import VALID_SOURCES, local_pipeline_ui_enabled, run_pipeline
 # --- AI helpers (chat + context) -----------------------------------------------
 from ai_context import (
@@ -47,10 +48,37 @@ from health_status import build_dashboard_health
 from status_store import list_recent_reports
 from forecast_lab.ui import render_forecast_lab
 from volatility_dashboard import render_volatility_dashboard
+from macro_engine.visualization.electricity_dashboard import render_electricity_dashboard
 # ------------------------------------------------------------------------------
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 DEFAULT_DATA_BASE_URL = "https://raw.githubusercontent.com/marshdoggo/mktme-data/main"
+UNIVERSE_OPTIONS = [
+    "sp500",
+    "nasdaq100",
+    "dow30",
+    "fx_current",
+    "fx",
+    "fx_g10_majors",
+    "fx_em_exotic",
+    "fx_scandi",
+    "fx_cnh",
+]
+UNIVERSE_LABELS = {
+    "sp500": "S&P 500",
+    "nasdaq100": "Nasdaq 100",
+    "dow30": "Dow 30",
+    "fx_current": "Current FX universe",
+    "fx": "FOREX.com Core FX",
+    "fx_g10_majors": "G10 majors only",
+    "fx_em_exotic": "EM / exotic FX",
+    "fx_scandi": "Scandi FX",
+    "fx_cnh": "CNH FX",
+}
+
+
+def _is_fx_universe(universe: str) -> bool:
+    return str(universe).strip().lower().replace("-", "_") in FX_UNIVERSE_ALIASES
 
 
 # --- Manifest/Parquet loader (prefer external loader.py; fallback to inline) ----
@@ -181,7 +209,7 @@ with st.expander("Pipeline health details", expanded=False):
 with st.sidebar:
     app_section = st.radio(
         "App section",
-        ["Metric Explorer", "Volatility Dashboard"],
+        ["Metric Explorer", "Volatility Dashboard", "Macro"],
         index=0,
         key="app_section",
     )
@@ -196,6 +224,12 @@ if app_section == "Volatility Dashboard":
     )
     st.stop()
 
+if app_section == "Macro":
+    macro_view = st.sidebar.selectbox("Macro dataset", ["Electricity Production"], index=0)
+    if macro_view == "Electricity Production":
+        render_electricity_dashboard()
+    st.stop()
+
 with st.sidebar:
     st.header('Settings')
     if st.button("🔄 Refresh cached data", help="Clears Streamlit cached downloads (manifest, parquet, reports). Useful when a new publisher run landed but the app is still showing older data."):
@@ -204,8 +238,9 @@ with st.sidebar:
         st.rerun()
     universe = st.selectbox(
         'Universe',
-        ['sp500', 'nasdaq100', 'dow30', 'fx'],
+        UNIVERSE_OPTIONS,
         index=0,
+        format_func=lambda value: UNIVERSE_LABELS.get(value, value),
         help='Pick the asset universe to analyze'
     )
     lookback = st.number_input('Lookback (trading days)', min_value=60, max_value=2520, value=252, step=21)
@@ -214,8 +249,9 @@ with st.sidebar:
             st.caption("Runs only from this checkout. It is hidden on Streamlit Cloud unless explicitly enabled.")
             pipeline_universes = st.multiselect(
                 "Universes",
-                ["sp500", "nasdaq100", "dow30", "fx"],
+                UNIVERSE_OPTIONS,
                 default=["sp500", "nasdaq100", "dow30", "fx"],
+                format_func=lambda value: UNIVERSE_LABELS.get(value, value),
                 key="local_pipeline_universes",
             )
             pipeline_source = st.selectbox(
@@ -278,7 +314,7 @@ if universe == 'sp500':
     tickers_df = get_sp500_constituents(force_refresh=False)
 else:
     tickers_df = get_universe(universe, force_refresh=False)
-meta = get_meta() if universe != 'fx' else {}
+meta = get_meta() if not _is_fx_universe(universe) else {}
 
 # --- Load cached prices from manifest/Parquet -------------------------------
 with st.spinner('Loading cached prices…'):
@@ -438,7 +474,7 @@ numeric_metrics = _numeric_metric_options(metrics_df_A)
 default_x = _first_available(["Sortino Ratio", "Annualized Sharpe"], numeric_metrics)
 default_y = _first_available(["Annualized Sharpe", "Sortino Ratio"], numeric_metrics, default_x)
 default_size = "(None)"
-default_color = "Sector" if universe != "fx" else "SubIndustry"
+default_color = "Sector" if not _is_fx_universe(universe) else "SubIndustry"
 
 
 def _option_index(options: list[str], value: str) -> int:
@@ -562,7 +598,7 @@ else:
     col3 = col4 = None
 
 if enable_color_metric:
-    color_options = ['Sector','SubIndustry','(None)'] if universe != 'fx' else ['SubIndustry','(None)']
+    color_options = ['Sector','SubIndustry','(None)'] if not _is_fx_universe(universe) else ['SubIndustry','(None)']
     color_options = [c for c in color_options if c == '(None)' or c in metrics_df_A.columns] + [
         m for m in numeric_metrics if m not in {'Sector', 'SubIndustry'}
     ]

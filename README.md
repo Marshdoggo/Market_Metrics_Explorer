@@ -18,7 +18,7 @@ Current supported universes include:
 
 - Dow Jones Industrial Average
 
-- Major FX currency pairs
+- Expanded FOREX.com-inspired FX universes, including majors, G10 crosses, Scandi, CNH, and EM/exotic FX slices
 
 ---
 
@@ -41,6 +41,43 @@ Current supported universes include:
 - Integrated AI-assisted chart interpretation
 
 - Technical signal metrics for dip-buy, bearish breakdown, and momentum-continuation research
+
+- Macro data engine reference pipeline for U.S. electricity production using the EIA API
+
+---
+
+## Macro Data Engine
+
+The first macroeconomic data pipeline ingests U.S. monthly electricity generation from the EIA, normalizes fuel-level production data, computes growth/trend/fuel-mix metrics, and powers a new `Macro -> Electricity Production` dashboard in the Streamlit app.
+
+Standalone run:
+
+```bash
+python scripts/fetch_electricity.py
+```
+
+See `docs/us_electricity_intelligence_pipeline.md` for setup, schema, architecture, and extension notes.
+
+Manual Trading Economics exports can be registered and normalized with:
+
+```bash
+python3 scripts/register_te_download.py
+python3 scripts/import_te_manual_exports.py
+```
+
+See `docs/trading_economics_manual_exports.md` for the inbox, manifest, overrides, and clean output workflow.
+
+## FX Universe
+
+The FX coverage now uses a broader FOREX.com-inspired core universe while preserving the original compact FX list as `fx_current`. Data availability is verified separately because broker-listed tradability does not guarantee Yahoo Finance coverage.
+
+Run the availability check with:
+
+```bash
+python scripts/check_fx_availability.py
+```
+
+See `docs/fx_universe.md` for categories, universe names, and availability behavior.
 
 ---
 

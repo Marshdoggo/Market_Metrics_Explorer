@@ -5,6 +5,7 @@ import os, time, json, pathlib
 from io import StringIO
 import pandas as pd
 import requests
+from fx_universe import FX_UNIVERSE_ALIASES, get_fx_universe
 
 CACHE_DIR = pathlib.Path(__file__).resolve().parent.parent / "data" / "cache_universes"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -62,7 +63,7 @@ def _read_wiki_constituents(url: str) -> pd.DataFrame:
 def get_universe(universe: str, force_refresh: bool = False) -> pd.DataFrame:
     """
     Returns columns: Ticker, Name, Sector, SubIndustry
-    Supported: sp500 (handled elsewhere), nasdaq100, dow30, fx
+    Supported: sp500 (handled elsewhere), nasdaq100, dow30, fx and FX slices
     """
     u = universe.lower()
     cp = _cache_path(u)
@@ -102,18 +103,8 @@ def get_universe(universe: str, force_refresh: bool = False) -> pd.DataFrame:
         out.to_parquet(cp, index=False)
         return out
 
-    elif u == "fx":
-        # Provide a curated FX universe (majors + a few crosses).
-        pairs = [
-            "EURUSD","GBPUSD","USDJPY","USDCHF","USDCAD","AUDUSD","NZDUSD",
-            "EURJPY","EURGBP","AUDJPY","GBPJPY","CHFJPY","EURCHF","NZDJPY",
-        ]
-        return pd.DataFrame({
-            "Ticker": pairs,
-            "Name": pairs,
-            "Sector": "FX",
-            "SubIndustry": [p[:3] for p in pairs],   # base currency
-        })
+    elif u in FX_UNIVERSE_ALIASES:
+        return get_fx_universe(u)
 
     else:
         raise ValueError(f"Unknown universe: {universe}")
