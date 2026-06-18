@@ -1,15 +1,15 @@
 {
-  "generated_at": "2026-06-17T08:37:14+00:00",
+  "generated_at": "2026-06-18T08:15:46+00:00",
   "latest_run": {
     "details": {
       "data_repo": "/home/runner/work/Market_Metrics_Explorer/Market_Metrics_Explorer/mktme_data",
       "latest_report_dates": {
-        "dow30": "2026-06-16",
-        "fx": "2026-06-16",
-        "nasdaq100": "2026-06-16",
-        "sp500": "2026-06-16"
+        "dow30": "2026-06-17",
+        "fx": "2026-06-17",
+        "nasdaq100": "2026-06-17",
+        "sp500": "2026-06-17"
       },
-      "manifest_generated_at": "2026-06-17T08:37:14+00:00",
+      "manifest_generated_at": "2026-06-18T08:15:46+00:00",
       "published_market_data": [
         "vix"
       ],
@@ -28,15 +28,25 @@
       "used_existing_parquet": false
     },
     "error_summary": null,
-    "finished_at": "2026-06-17T08:37:14+00:00",
-    "git_sha": "b1ecdd786ee7782adda14f87e682117af321a241",
-    "id": 31,
+    "finished_at": "2026-06-18T08:15:46+00:00",
+    "git_sha": "4d4225d6509ee19c79aca74b469d1a07ae4b95e8",
+    "id": 32,
     "mode": "legacy_publish",
-    "started_at": "2026-06-17T07:27:47+00:00",
+    "started_at": "2026-06-18T07:06:13+00:00",
     "status": "success",
     "trigger_type": "schedule"
   },
   "recent_runs": [
+    {
+      "error_summary": null,
+      "finished_at": "2026-06-18T08:15:46+00:00",
+      "git_sha": "4d4225d6509ee19c79aca74b469d1a07ae4b95e8",
+      "id": 32,
+      "mode": "legacy_publish",
+      "started_at": "2026-06-18T07:06:13+00:00",
+      "status": "success",
+      "trigger_type": "schedule"
+    },
     {
       "error_summary": null,
       "finished_at": "2026-06-17T08:37:14+00:00",
@@ -126,25 +136,15 @@
       "started_at": "2026-06-04T06:54:23+00:00",
       "status": "success",
       "trigger_type": "schedule"
-    },
-    {
-      "error_summary": null,
-      "finished_at": "2026-06-03T08:14:01+00:00",
-      "git_sha": "2770241fcb534eadd80a6eb932dc2d245c755f36",
-      "id": 22,
-      "mode": "legacy_publish",
-      "started_at": "2026-06-03T07:04:39+00:00",
-      "status": "success",
-      "trigger_type": "schedule"
     }
   ],
   "status": {
     "legacy.data_repo_path": "/home/runner/work/Market_Metrics_Explorer/Market_Metrics_Explorer/mktme_data",
-    "legacy.latest_report_date.dow30": "2026-06-16",
-    "legacy.latest_report_date.fx": "2026-06-16",
-    "legacy.latest_report_date.nasdaq100": "2026-06-16",
-    "legacy.latest_report_date.sp500": "2026-06-16",
-    "legacy.manifest_generated_at": "2026-06-17T08:37:14+00:00",
+    "legacy.latest_report_date.dow30": "2026-06-17",
+    "legacy.latest_report_date.fx": "2026-06-17",
+    "legacy.latest_report_date.nasdaq100": "2026-06-17",
+    "legacy.latest_report_date.sp500": "2026-06-17",
+    "legacy.manifest_generated_at": "2026-06-18T08:15:46+00:00",
     "legacy.manifest_universes": [
       "dow30",
       "fx",
@@ -153,14 +153,14 @@
     ],
     "legacy.manifest_url": "mktme-data/manifest.json",
     "legacy.publisher_owner": "main_repo",
-    "legacy.report_index_generated_at": "2026-06-17T08:37:13+00:00",
+    "legacy.report_index_generated_at": "2026-06-18T08:15:45+00:00",
     "legacy.reports_index_url": "mktme-data/reports/index.json",
     "market_data.vix_artifact_path": "market/vix.parquet",
-    "market_data.vix_asof_date": "2026-06-16",
+    "market_data.vix_asof_date": "2026-06-17",
     "pipeline.last_error": null,
-    "pipeline.last_finished_at": "2026-06-17T08:37:14+00:00",
-    "pipeline.last_started_at": "2026-06-17T07:27:47+00:00",
-    "pipeline.last_success_at": "2026-06-17T08:37:14+00:00",
+    "pipeline.last_finished_at": "2026-06-18T08:15:46+00:00",
+    "pipeline.last_started_at": "2026-06-18T07:06:13+00:00",
+    "pipeline.last_success_at": "2026-06-18T08:15:46+00:00",
     "pipeline.mode": "legacy_publish",
     "pipeline.summary": "Legacy artifact publish completed successfully from the main repo."
   }
