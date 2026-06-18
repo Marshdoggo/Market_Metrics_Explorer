@@ -9,7 +9,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 VALID_SOURCES = ["auto", "twelvedata", "alphavantage", "yahoo", "stooq"]
-DEFAULT_UNIVERSES = ["sp500", "nasdaq100", "dow30", "fx"]
+DEFAULT_UNIVERSES = [
+    "sp500",
+    "nasdaq100",
+    "dow30",
+    "fx_current",
+    "fx",
+    "fx_g10_majors",
+    "fx_em_exotic",
+    "fx_scandi",
+    "fx_cnh",
+]
 
 
 @dataclass(frozen=True)

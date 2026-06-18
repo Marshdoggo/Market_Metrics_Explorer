@@ -114,6 +114,7 @@ def run_probe(trigger_type: str) -> None:
 
 def run_publish_from_args(args: argparse.Namespace) -> None:
     from publish_legacy_artifacts import run_publish  # noqa: WPS433
+    from fx_universe import FX_UNIVERSE_ALIASES  # noqa: WPS433
 
     source_by_universe = {
         "sp500": (args.source_sp500 or args.equity_source).strip().lower(),
@@ -121,6 +122,8 @@ def run_publish_from_args(args: argparse.Namespace) -> None:
         "dow30": (args.source_dow30 or args.equity_source).strip().lower(),
         "fx": (args.source_fx or args.equity_source).strip().lower(),
     }
+    for alias in FX_UNIVERSE_ALIASES:
+        source_by_universe[alias] = source_by_universe["fx"]
     run_publish(
         data_repo=Path(args.data_repo).expanduser(),
         universes=[u.lower() for u in args.universes],
@@ -157,7 +160,18 @@ def main() -> None:
         "--universes",
         nargs="+",
         default=os.environ.get("MKTME_UNIVERSES", "sp500 nasdaq100 dow30 fx").split(),
-        choices=["sp500", "nasdaq100", "dow30", "fx"],
+        choices=[
+            "sp500",
+            "nasdaq100",
+            "dow30",
+            "fx_current",
+            "fx",
+            "fx_forex_com_core",
+            "fx_g10_majors",
+            "fx_em_exotic",
+            "fx_scandi",
+            "fx_cnh",
+        ],
     )
     parser.add_argument("--equity-source", default=os.environ.get("MKTME_EQUITY_SOURCE", "auto"))
     parser.add_argument("--source-sp500", default=os.environ.get("MKTME_SOURCE_SP500", ""))

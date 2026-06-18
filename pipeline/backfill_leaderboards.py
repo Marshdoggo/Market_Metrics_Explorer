@@ -15,6 +15,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from fetch_data import get_sp500_constituents  # noqa: E402
+from fx_universe import FX_UNIVERSE_ALIASES  # noqa: E402
 from leaderboards import append_snapshot_rows, build_leaderboard_snapshots, snapshot_path  # noqa: E402
 from universes import get_universe  # noqa: E402
 
@@ -178,7 +179,16 @@ def backfill_leaderboards(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backfill leaderboard snapshot history from published price parquet.")
     parser.add_argument("--data-repo", default=os.environ.get("MKTME_DATA_REPO", str(ROOT / "mktme-data")))
-    parser.add_argument("--universe", default="dow30", choices=["sp500", "nasdaq100", "dow30", "fx"])
+    parser.add_argument(
+        "--universe",
+        default="dow30",
+        choices=[
+            "sp500",
+            "nasdaq100",
+            "dow30",
+            *sorted(FX_UNIVERSE_ALIASES),
+        ],
+    )
     parser.add_argument("--lookback", type=int, default=int(os.environ.get("MKTME_LOOKBACK", "252")))
     parser.add_argument("--history-days", type=int, default=252)
     parser.add_argument("--force", action="store_true", help="Rebuild duplicate snapshot keys instead of preserving existing rows.")
