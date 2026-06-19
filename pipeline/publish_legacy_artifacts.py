@@ -151,13 +151,25 @@ def _load_or_fetch_prices(
             )
         )
 
-    if existing_path.exists() and not fresh.empty:
+    if existing_path.exists():
         try:
             existing = _to_naive_dt_index(pd.read_parquet(existing_path))
-            # Keep freshly fetched values where available, but backfill symbols/rows the provider missed.
-            fresh = fresh.combine_first(existing)
-        except Exception:
-            pass
+            if fresh.empty and not existing.empty:
+                print(
+                    f"[publish] Live refresh returned no rows for universe '{universe}'; "
+                    f"using existing parquet at {existing_path}.",
+                    flush=True,
+                )
+                return existing
+            if not fresh.empty:
+                # Keep freshly fetched values where available, but backfill symbols/rows the provider missed.
+                fresh = fresh.combine_first(existing)
+        except Exception as exc:
+            print(
+                f"[publish] Existing parquet fallback unavailable for universe '{universe}': "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
     return fresh
 
 
