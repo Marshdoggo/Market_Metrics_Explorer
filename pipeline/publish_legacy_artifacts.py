@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import subprocess
@@ -297,17 +298,23 @@ def _write_report_artifacts(
     else:
         asof_date = pd.Timestamp.utcnow().date().isoformat()
 
-    daily = generate_daily_report(
-        metrics_df=metrics_df,
-        universe=universe,
-        asof_date=asof_date,
-        lookback=lookback,
-        primary_rank_metric="Annualized Sharpe",
-        top_n=5,
-        leaderboard_context=leaderboard_context,
-        enable_llm_commentary=os.environ.get("MKTME_ENABLE_LLM_COMMENTARY", "").lower() in {"1", "true", "yes"},
-        llm_model=os.environ.get("MKTME_LLM_MODEL", "gpt-4.1-mini"),
-    )
+    report_kwargs = {
+        "metrics_df": metrics_df,
+        "universe": universe,
+        "asof_date": asof_date,
+        "lookback": lookback,
+        "primary_rank_metric": "Annualized Sharpe",
+        "top_n": 5,
+        "leaderboard_context": leaderboard_context,
+    }
+    supported_report_kwargs = set(inspect.signature(generate_daily_report).parameters)
+    if "enable_llm_commentary" in supported_report_kwargs:
+        report_kwargs["enable_llm_commentary"] = (
+            os.environ.get("MKTME_ENABLE_LLM_COMMENTARY", "").lower() in {"1", "true", "yes"}
+        )
+    if "llm_model" in supported_report_kwargs:
+        report_kwargs["llm_model"] = os.environ.get("MKTME_LLM_MODEL", "gpt-4.1-mini")
+    daily = generate_daily_report(**report_kwargs)
     daily.report["facts"] = daily.facts
     daily.report["run_utc"] = utc_now_iso()
     daily.report["markdown"] = daily.markdown
