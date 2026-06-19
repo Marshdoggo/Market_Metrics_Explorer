@@ -29,7 +29,7 @@ on:
       source_fx:
         description: "Optional source override for fx"
         required: false
-        default: "alphavantage"
+        default: "yahoo"
       use_existing_parquet:
         description: "Reuse checked-out mktme-data parquet files instead of live refresh"
         required: false
@@ -106,7 +106,7 @@ jobs:
             export MKTME_SOURCE_SP500="twelvedata"
             export MKTME_SOURCE_NASDAQ100="twelvedata"
             export MKTME_SOURCE_DOW30="twelvedata"
-            export MKTME_SOURCE_FX="alphavantage"
+            export MKTME_SOURCE_FX="yahoo"
             UNIVERSES="sp500 nasdaq100 dow30 fx"
             USE_EXISTING_PARQUET="false"
             BACKFILL_LEADERBOARDS="false"
