@@ -3,8 +3,20 @@ import os, json, pandas as pd, requests
 from io import BytesIO
 from urllib.parse import urlencode
 
+from fx_universe import FX_UNIVERSE_ALIASES
+
 DEFAULT_MANIFEST = "https://raw.githubusercontent.com/marshdoggo/mktme-data/main/manifest.json"
 MANIFEST_URL = os.environ.get("MKTME_MANIFEST_URL", DEFAULT_MANIFEST)
+
+
+def _manifest_universe_key(universe: str, manifest: dict) -> str:
+    key = str(universe).strip().lower().replace("-", "_")
+    universes = manifest.get("universes") or {}
+    if key in universes:
+        return key
+    if key in FX_UNIVERSE_ALIASES and "fx" in universes:
+        return "fx"
+    return key
 
 def _ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -44,8 +56,9 @@ def load_parquet_http(url: str, cache_key: str | None = None) -> pd.DataFrame:
 
 def get_prices_for_universe(universe: str) -> pd.DataFrame:
     m = _load_manifest()
+    manifest_key = _manifest_universe_key(universe, m)
     try:
-        url = m["universes"][universe]["parquet_url"]
+        url = m["universes"][manifest_key]["parquet_url"]
     except Exception:
         raise RuntimeError(f"Universe '{universe}' not present in manifest {MANIFEST_URL}")
     cache_key = str(m.get("generated_at") or "")
