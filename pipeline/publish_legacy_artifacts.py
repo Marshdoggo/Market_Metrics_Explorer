@@ -430,6 +430,17 @@ def _write_manifest(
     return manifest
 
 
+def _append_github_step_summary(lines: list[str]) -> None:
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    try:
+        with open(summary_path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines).rstrip() + "\n")
+    except Exception as exc:
+        print(f"[publish] Unable to write GitHub Actions summary: {type(exc).__name__}: {exc}", flush=True)
+
+
 def run_publish(
     *,
     data_repo: Path,
@@ -451,6 +462,7 @@ def run_publish(
     rel_paths: dict[str, str] = {}
     market_rel_paths: dict[str, str] = {}
     asof_dates: dict[str, str] = {}
+    summary_rows: list[dict[str, Any]] = []
 
     try:
         data_repo.mkdir(parents=True, exist_ok=True)
@@ -544,6 +556,15 @@ def run_publish(
                 facts_path=report_paths["facts_path"],
             )
             set_status(f"legacy.latest_report_date.{universe}", asof_dates[universe])
+            summary_rows.append(
+                {
+                    "universe": universe,
+                    "retrieval": "OK",
+                    "data_through": asof_date,
+                    "symbols": int(prices.shape[1]),
+                    "rows": int(prices.shape[0]),
+                }
+            )
 
         if include_vix:
             try:
@@ -592,12 +613,43 @@ def run_publish(
             "used_existing_parquet": use_existing_parquet,
         }
         finish_pipeline_run(run_id, "success", details=details)
+        _append_github_step_summary(
+            [
+                "## PIPELINE STATUS",
+                "",
+                "| Universe | Retrieval | Data Through | Symbols | Rows |",
+                "| --- | --- | --- | ---: | ---: |",
+                *[
+                    f"| {row['universe']} | {row['retrieval']} | {row['data_through']} | {row['symbols']} | {row['rows']} |"
+                    for row in summary_rows
+                ],
+                "",
+                f"Artifacts published: {len(rel_paths) + len(market_rel_paths)}",
+                "Warnings: see job log for universe-source fallback warnings.",
+                "Failures: 0",
+            ]
+        )
     except Exception as exc:
         message = f"{type(exc).__name__}: {exc}"
         set_status("pipeline.last_finished_at", utc_now_iso())
         set_status("pipeline.last_error", message)
         set_status("pipeline.summary", "Legacy artifact publish failed from the main repo.")
         finish_pipeline_run(run_id, "failed", error_summary=message)
+        _append_github_step_summary(
+            [
+                "## PIPELINE STATUS",
+                "",
+                "Status: FAILED",
+                f"Failure: `{message}`",
+                "",
+                "| Universe | Retrieval | Data Through | Symbols | Rows |",
+                "| --- | --- | --- | ---: | ---: |",
+                *[
+                    f"| {row['universe']} | {row['retrieval']} | {row['data_through']} | {row['symbols']} | {row['rows']} |"
+                    for row in summary_rows
+                ],
+            ]
+        )
         raise
     finally:
         write_status_snapshot_json()
