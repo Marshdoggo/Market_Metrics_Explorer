@@ -1,5 +1,6 @@
 import os
 import sys
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -64,3 +65,38 @@ def test_invalid_cache_is_not_accepted(monkeypatch, tmp_path):
 def test_nasdaq_sanity_check_rejects_unrealistic_count():
     with pytest.raises(ValueError, match="outside expected range"):
         universes._normalize_constituents(pd.DataFrame(_rows(10)), "nasdaq100", "test")
+
+
+def test_current_dow_fixture_returns_exactly_30_valid_constituents(monkeypatch):
+    fixture_path = Path(__file__).parent / "fixtures" / "dow30_components.html"
+    fixture_html = fixture_path.read_text(encoding="utf-8")
+
+    class MockResponse:
+        text = fixture_html
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    def mock_get(url, headers, timeout):
+        assert url == universes.WIKI_PAGES["dow30"]
+        assert headers["User-Agent"]
+        assert timeout == 20
+        return MockResponse()
+
+    monkeypatch.setattr(universes.requests, "get", mock_get)
+
+    out = universes._read_wiki_constituents(
+        universes.WIKI_PAGES["dow30"],
+        universe="dow30",
+    )
+
+    assert out.columns.tolist() == universes.REQUIRED_COLUMNS
+    assert len(out) == 30
+    assert out["Ticker"].is_unique
+    assert out["Ticker"].map(universes._looks_like_ticker).all()
+    assert set(out["Ticker"]) == {
+        "AAPL", "AMGN", "AMZN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS",
+        "GOOGL", "GS", "HD", "HON", "IBM", "JNJ", "JPM", "KO", "MCD", "MMM", "MRK",
+        "MSFT", "NKE", "NVDA", "PG", "SHW", "TRV", "UNH", "V", "WMT",
+    }
