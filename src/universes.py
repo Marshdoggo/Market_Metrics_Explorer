@@ -16,7 +16,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 WIKI_PAGES = {
     "nasdaq100": "https://en.wikipedia.org/wiki/List_of_NASDAQ-100_companies",
-    "dow30": "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average",
+    "dow30": "https://en.wikipedia.org/wiki/List_of_Dow_Jones_Industrial_Average_companies",
 }
 
 WIKI_FALLBACK_PAGES = {
